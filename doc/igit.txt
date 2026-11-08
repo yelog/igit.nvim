@@ -1,0 +1,147 @@
+*igit.txt*                   Native IGit inside Neovim
+
+==============================================================================
+CONTENTS                                                       *igit.nvim*
+
+    Requirements ......................................... |igit-requirements|
+    Commands ............................................. |igit-commands|
+    Configuration ........................................ |igit-configuration|
+    Lua API .............................................. |igit-api|
+    Sessions ............................................. |igit-sessions|
+    Edit working files ................................... |igit-edit-file|
+
+==============================================================================
+REQUIREMENTS                                                *igit-requirements*
+
+Neovim 0.10 or newer and an IGit executable supporting panel commands and native
+file history. IGit is installed separately. No Lua dependencies are required.
+
+==============================================================================
+COMMANDS                                                        *igit-commands*
+
+:Igit [panel]                                                        *:Igit*
+    Open Commit by default, or the commit, log, push, branch, or stash panel.
+    Starts in the invoking window's current directory, including :lcd/:tcd.
+
+:Igit log {file}
+    Open native Git history for a file. Relative paths use the invoking working
+    directory. Quote paths with spaces or escape them with a backslash. `%`
+    uses the originating editor file, even when invoked from the IGit terminal.
+    For a literal file named %, use ./%. Unsaved buffer edits are not included.
+    The executable receives: igit log -- {absolute-file-path}
+
+:IgitClose                                                       *:IgitClose*
+    Hide the current IGit window and return focus. Its process keeps running.
+
+The interactive lowercase spelling :igit is a |:cnoreabbrev|, because Neovim
+requires user-command names to begin with an uppercase letter. It expands at
+the start of a command line when followed by a space or Enter. It does not
+change searches or arguments. Use :Igit in scripts, mappings, vim.cmd(), and
+after command modifiers. An existing abbreviation is not overwritten.
+
+Use <C-\><C-n> to leave terminal input mode before entering editor commands.
+The plugin does not intercept IGit's own keys. See |terminal-input|.
+
+==============================================================================
+CONFIGURATION                                               *igit-configuration*
+
+Setup is optional. Defaults: >lua
+    require("igit").setup({
+      command = "igit",
+      command_alias = true,
+      window = {
+        layout = "float",
+        border = "rounded",
+      },
+    })
+<
+command       An executable path, argv list, or function returning either.
+              Functions run on every open before session lookup, not at setup.
+              Strings are never evaluated by a shell. The panel and optional
+              -- {file} are appended. Resolver errors leave existing jobs intact.
+command_alias Set false to disable the interactive :igit abbreviation.
+window.layout "float", "left", "right", "bottom", or "tab".
+window.width  Fraction between 0 and 1, or a positive integer column count.
+              Defaults to 90% for floats and 50% for side splits.
+window.height Fraction between 0 and 1, or a positive integer row count.
+              Defaults to 85% for floats and 40% for bottom splits.
+window.border Floating border, as accepted by |nvim_open_win()|.
+
+Tabs fill their tab page. Splits use only the relevant dimension. Floats and
+splits respond to editor resize. Setup replaces the previous configuration
+with defaults plus supplied values, without stopping running processes.
+
+For local development, use the built binary: >lua
+    require("igit").setup({
+      command = vim.fn.expand("~/workspace/tui/igit/target/debug/igit"),
+    })
+<
+Extra executable arguments use a list, for example: >lua
+    require("igit").setup({
+      command = { "cargo", "run", "--quiet", "--locked",
+        "--manifest-path", "/path/to/igit/Cargo.toml",
+        "--bin", "igit", "--" },
+    })
+<
+==============================================================================
+EDIT WORKING FILES                                            *igit-edit-file*
+
+Press e or E on a file in Commit Changes to edit its working copy in this Neovim
+instance. Requires the matching native IGit build. Existing loaded buffers keep
+unsaved text. Floating IGit windows hide after the switch; split windows remain
+visible and tab sessions remain open while focus returns to the source window.
+The terminal job, drafts and checked files are retained; reopen the same command
+or use your IGit mapping to return. Saving updates the working copy, and IGit's
+watcher refreshes the view. Opening/editing does not stage the file.
+
+Normal modified-buffer guards apply. A blocked switch or missing file leaves
+the IGit window available with an error. Containers, deleted files and submodule
+directories require an existing file target. The plugin handles session-scoped
+terminal requests; no RPC server or second editor is needed. Outside this plugin,
+IGit uses the editor selected by git var GIT_EDITOR.
+
+==============================================================================
+LUA API                                                             *igit-api*
+
+require("igit").setup({options})
+    Configure the plugin. See |igit-configuration|.
+
+require("igit").open({panel}, {options})
+    Both arguments are optional. Panel defaults to "commit". Returns the
+    terminal buffer number, or nil and an error string with a notification.
+
+    Options:
+      file    File path, only with the log panel. "%" uses the source buffer.
+      cwd     Directory for the native process. Defaults to the invoking cwd.
+      window  Per-opening overrides of the configured window table.
+
+    Example: >lua
+        require("igit").open("log", {
+          file = "%",
+          window = { layout = "right", width = 70 },
+        })
+<
+require("igit").close()
+    Hide the managed IGit window without stopping its process. Returns true
+    if a window was hidden, false otherwise.
+
+==============================================================================
+SESSIONS                                                        *igit-sessions*
+
+The same argv and working directory reuse a terminal. Different panels or file
+paths create separate sessions, hiding the previously managed window. Open the
+same request to resume it. Changing layout does not restart the process.
+
+A command function can return the resolved path of a selected build. Different
+executable paths retain separate sessions; switching back resumes the old job.
+Rebuilding a binary at the same path does not update its running process. Quit
+IGit normally and reopen it to test that rebuild.
+
+IGit terminal buffers are listed in :buffers. :IgitClose and normal window
+closing preserve the running job. Quit normally inside IGit to finish; a zero
+exit status cleans up the terminal. A nonzero exit leaves its output available,
+reports the exit code, and permits a new launch. Use :bdelete! to explicitly
+stop and remove a terminal buffer.
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:
