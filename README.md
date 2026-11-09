@@ -14,13 +14,13 @@ With lazy.nvim and the local checkout:
   name = "igit.nvim",
   lazy = false, -- Also installs the interactive :igit abbreviation at startup.
   opts = {
-    command = vim.fn.expand("~/workspace/tui/igit/target/debug/igit"),
+    command = "igit",
     window = { layout = "float" },
   },
 }
 ```
 
-Build that local binary from the IGit repository with `cargo build --locked --bin igit`. If `igit` is on `PATH`, omit `command`. For a GitHub installation, use `"yelog/igit.nvim"` instead of `dir` and `name`.
+Install IGit separately and make sure `igit` is on Neovim's `PATH`. You can omit `command` because it defaults to `"igit"`. For a GitHub installation of the plugin, use `"yelog/igit.nvim"` instead of `dir` and `name`.
 
 For Neovim's built-in package loader, put or symlink this checkout at `~/.local/share/nvim/site/pack/local/start/igit.nvim`, then optionally configure it in `init.lua`:
 
@@ -113,15 +113,11 @@ end, { desc = "IGit file history" })
 
 `open(panel?, options?)` returns the terminal buffer number, or `nil, error` and a notification. `panel` defaults to `"commit"`; `options` supports `file`, `cwd`, and per-opening `window` overrides. Changing a layout reuses the same process. `close()` returns whether a managed window was hidden. Calling `setup()` again replaces the configuration with the defaults plus the supplied options; existing jobs continue running.
 
-The executable is launched with an argv list, never through a shell. Configure extra executable arguments as a list, for example when running a local build through Cargo:
+The executable is launched with an argv list. To pass arguments to the installed `igit` command, configure `command` as a list:
 
 ```lua
 require("igit").setup({
-  command = {
-    "cargo", "run", "--quiet", "--locked",
-    "--manifest-path", vim.fn.expand("~/workspace/tui/igit/Cargo.toml"),
-    "--bin", "igit", "--",
-  },
+  command = { "igit", "--icons", "unicode" },
 })
 ```
 
