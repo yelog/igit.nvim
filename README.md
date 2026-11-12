@@ -1,6 +1,6 @@
 # igit.nvim
 
-Run the native [IGit](https://github.com/yelog/igit) terminal workspace inside Neovim. Open Commit, Log, Push, Branch, Stash, or a file's native history in a floating window, a left/right/bottom split, or a tab.
+Run the native [IGit](https://github.com/yelog/igit) terminal workspace inside Neovim. Open Commit, Log, Push, Branch, Stash, or a file's native history in a floating window, a left/right/bottom split, or a tab. Select a commit in File History to inspect that revision of the file in a read-only buffer.
 
 Requires Neovim **0.10+** and an IGit executable with panel and file-history command support. The plugin has no Lua dependencies and does not install IGit.
 
@@ -90,6 +90,43 @@ requires no RPC server, and does not launch another Neovim process. Both plugin
 and executable must support this feature; standalone IGit uses Git's configured
 external editor.
 
+## Show a file at a revision
+
+In a matching native IGit build, highlight a commit in File History and press `e`
+to show the selected revision of the file. The buffer is listed and read-only,
+with no file writes, swap file, undo file, or modifications to the current
+working buffer. Its displayed title follows IDEA's form, for example
+`user.ts (69028162)`, where the value is the first eight characters of the full
+commit hash. The filetype and syntax are inferred from the original filename and
+path. Homogeneous CRLF uses `fileformat=dos`; mixed line endings, missing final
+newlines, and empty blobs retain their original bytes.
+
+The buffer name includes the repository, historical path, and full revision.
+Opening the same repository, path, and revision again reuses the buffer; another
+revision gets a separate buffer. Existing buffers and unsaved text for the
+working copy are retained. Missing paths, submodules, non-blob entries, binary
+data, invalid UTF-8, and blobs larger than 512 KiB are rejected without replacing
+the editor buffer. Floating IGit windows hide after the revision opens; splits
+and tabs follow the same focus behavior as editing a working file.
+
+### Revision request protocol
+
+The plugin consumer listens for this terminal request:
+
+```text
+ESC ] 51 ; igit-show-revision ; JSON BEL
+```
+
+`JSON` contains `version` (`1`), `session` (the process's
+`IGIT_NVIM_SESSION` token), `repo` (absolute repository path), `path` (relative
+historical Git path), and `revision` (full 40- or 64-character hexadecimal
+commit hash). The producer validates the blob as UTF-8, NUL-free, and at most
+512 KiB before sending. The plugin additionally accepts only the active
+terminal session and focused IGit window, then runs argv-based `git cat-file`
+type, size, and blob queries without a shell. Foreign, malformed, stale, or
+otherwise invalid requests are ignored or rejected without stealing focus.
+Git reads use raw output with optional locks and lazy fetching disabled.
+
 ## Lua API and mappings
 
 ```lua
@@ -149,6 +186,6 @@ Run the dependency-free integration suite from this repository:
 nvim --headless -u NONE -l tests/run.lua
 ```
 
-The suite uses temporary files and fake terminal processes; it does not invoke Git, real IGit, or external services. It exercises real Neovim windows, jobs, command-line input, and session cleanup. The Neovim 0.10 API baseline is documented in the official [window and command APIs](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/api.txt) and [terminal job functions](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/builtin.txt). The included suite has been run on Neovim 0.12.4.
+The suite uses temporary files, local Git repositories, and fake terminal processes; it does not invoke real IGit or external services. It exercises real Neovim windows, asynchronous Git reads, command-line input, and session cleanup. The Neovim 0.10 API baseline is documented in the official [window and command APIs](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/api.txt) and [terminal job functions](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/builtin.txt). The included suite has been run on Neovim 0.12.4.
 
 See `:help igit.nvim` for the reference. Package managers usually generate help tags; for a manual installation, run `:helptags ALL` once.

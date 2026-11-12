@@ -9,12 +9,15 @@ CONTENTS                                                       *igit.nvim*
     Lua API .............................................. |igit-api|
     Sessions ............................................. |igit-sessions|
     Edit working files ................................... |igit-edit-file|
+    Show file revisions .................................. |igit-revision-file|
+    Revision request protocol ...................... |igit-revision-protocol|
 
 ==============================================================================
 REQUIREMENTS                                                *igit-requirements*
 
-Neovim 0.10 or newer and an IGit executable supporting panel commands and native
-file history. IGit is installed separately. No Lua dependencies are required.
+Neovim 0.10 or newer and an IGit executable supporting panel commands, native
+file history, and revision viewing. IGit is installed separately. No Lua
+dependencies are required.
 
 ==============================================================================
 COMMANDS                                                        *igit-commands*
@@ -99,6 +102,54 @@ the IGit window available with an error. Containers, deleted files and submodule
 directories require an existing file target. The plugin handles session-scoped
 terminal requests; no RPC server or second editor is needed. Outside this plugin,
 IGit uses the editor selected by git var GIT_EDITOR.
+
+==============================================================================
+SHOW FILE REVISIONS                                       *igit-revision-file*
+
+In File History, highlight a commit and press e to show the selected revision
+of the file. Requires a matching native IGit build. The revision is displayed
+in a listed, read-only, nofile buffer with no swap file, undo file, or write
+target. It does not replace or save the working buffer. The title follows
+IDEA's form, for example user.ts (69028162), where the suffix is the first
+eight characters of the full commit hash.
+
+Homogeneous CRLF uses 'fileformat' dos. Mixed line endings, missing final
+newlines, and empty blobs retain their original bytes.
+
+The buffer identity includes the repository, historical path, and full
+revision. Reopening the same combination reuses its buffer; another revision
+uses a separate buffer. The filetype and syntax come from the original filename
+and path. Missing paths, submodules, non-blob entries, binary data, invalid
+UTF-8, and blobs larger than 512 KiB are rejected. Floating IGit windows hide
+after a successful open; splits stay visible and tabs stay open while focus
+returns to the source window. Normal modified-buffer guards apply when 'hidden'
+is off.
+
+The native process reads an immutable Git blob and validates UTF-8, NULs, and
+the 512 KiB limit before emitting a request. The plugin repeats validation and
+rejects requests from another session, an unfocused IGit terminal, or a stale
+or malformed message.
+
+==============================================================================
+REVISION REQUEST PROTOCOL                           *igit-revision-protocol*
+
+The native process sends a terminal request through OSC 51: >
+    ESC ] 51 ; igit-show-revision ; {JSON} BEL
+<
+The JSON object is: >
+    {
+      "version": 1,
+      "session": "IGIT_NVIM_SESSION token",
+      "repo": "/absolute/repository/path",
+      "path": "relative/historical/git/path",
+      "revision": "full 40- or 64-character hexadecimal commit hash"
+    }
+<
+The plugin uses argv-based |vim.system()| calls to git cat-file for the object
+type, size, and blob. It does not invoke a shell. A request is accepted only for
+the current focused IGit terminal session; a delayed request cannot move focus
+after the terminal is hidden, replaced, or deleted.
+Git reads use raw output with optional locks and lazy fetching disabled.
 
 ==============================================================================
 LUA API                                                             *igit-api*

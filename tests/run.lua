@@ -399,6 +399,81 @@ local ok, err = xpcall(function()
     vim.fn.chansend(vim.b[buf].terminal_job_id, vim.json.encode({ version = 1, session = token, path = path }) .. "\n")
   end
 
+  local revision_bridge = temp .. "/fake revision bridge.sh"
+  vim.fn.writefile({
+    '#!/bin/sh',
+    'printf "%s\\n" "$IGIT_NVIM_SESSION" > "$IGIT_NVIM_RECORD"',
+    'while IFS= read -r request; do',
+    '  printf "\\033]51;igit-show-revision;%s\\007" "$request"',
+    'done',
+  }, revision_bridge)
+  vim.fn.setfperm(revision_bridge, "rwx------")
+
+  local function run_git(directory, arguments)
+    local argv = { "git", "-C", directory }
+    vim.list_extend(argv, arguments)
+    local result = vim.system(argv, { text = true }):wait()
+    assert(result.code == 0, table.concat(argv, " ") .. "\n" .. tostring(result.stderr))
+    return (result.stdout or ""):gsub("%s+$", "")
+  end
+
+  local function write_bytes(path, value)
+    local fd = assert(vim.uv.fs_open(path, "w", 420))
+    assert(vim.uv.fs_write(fd, value, -1))
+    assert(vim.uv.fs_close(fd))
+  end
+
+  local history_repo = temp .. "/history repo"
+  vim.fn.mkdir(history_repo .. "/src", "p")
+  run_git(history_repo, { "init", "-q" })
+  run_git(history_repo, { "config", "user.email", "igit@example.com" })
+  run_git(history_repo, { "config", "user.name", "IGit Test" })
+  vim.fn.writefile({ "export const user = 'first';" }, history_repo .. "/src/user.ts")
+  vim.fn.writefile({ "original rename" }, history_repo .. "/src/rename-me.ts")
+  vim.fn.writefile({ "deleted later" }, history_repo .. "/src/deleted.ts")
+  run_git(history_repo, { "add", "-A" })
+  run_git(history_repo, { "commit", "-qm", "first" })
+  local revision_one = run_git(history_repo, { "rev-parse", "HEAD" })
+  vim.fn.writefile({ "export const user = 'second';", "// 中文" }, history_repo .. "/src/user.ts")
+  assert(vim.uv.fs_rename(history_repo .. "/src/rename-me.ts", history_repo .. "/src/renamed-away.ts"))
+  assert(vim.uv.fs_unlink(history_repo .. "/src/deleted.ts"))
+  run_git(history_repo, { "add", "-A" })
+  run_git(history_repo, { "commit", "-qm", "second" })
+  local revision_two = run_git(history_repo, { "rev-parse", "HEAD" })
+  write_bytes(history_repo .. "/binary.dat", "prefix\0suffix\n")
+  write_bytes(history_repo .. "/invalid-utf8.dat", string.char(0xff, 0xfe, 0x0a))
+  vim.fn.writefile({ string.rep("x", 512 * 1024 + 1) }, history_repo .. "/large.txt")
+  local newline_cases = {
+    { path = "crlf.txt", content = "first\r\nsecond\r\n", lines = { "first", "second" }, format = "dos", eol = true },
+    { path = "crlf-no-final.txt", content = "first\r\nsecond\r", lines = { "first", "second\r" }, format = "dos", eol = false },
+    { path = "mixed.txt", content = "first\r\nsecond\nthird\r\n", lines = { "first\r", "second", "third\r" }, format = "unix", eol = true },
+    { path = "mixed-no-final.txt", content = "first\nsecond\r\nthird\r", lines = { "first", "second\r", "third\r" }, format = "unix", eol = false },
+    { path = "no-final.txt", content = "first\nsecond", lines = { "first", "second" }, format = "unix", eol = false },
+    { path = "empty.txt", content = "", lines = { "" }, format = "unix", eol = false },
+    { path = "bare-cr.txt", content = "first\rsecond\r", lines = { "first\rsecond\r" }, format = "unix", eol = false },
+  }
+  vim.fn.writefile({ "*.txt -text" }, history_repo .. "/.gitattributes")
+  for _, case in ipairs(newline_cases) do
+    write_bytes(history_repo .. "/" .. case.path, case.content)
+  end
+  run_git(history_repo, { "add", "-A" })
+  run_git(history_repo, { "commit", "-qm", "edge cases" })
+  local asset_revision = run_git(history_repo, { "rev-parse", "HEAD" })
+  run_git(history_repo, { "update-index", "--add", "--cacheinfo", "160000," .. revision_one .. ",vendor/module" })
+  run_git(history_repo, { "commit", "-qm", "gitlink" })
+  local submodule_revision = run_git(history_repo, { "rev-parse", "HEAD" })
+  history_repo = assert(vim.uv.fs_realpath(history_repo))
+
+  local function revision_request(buf, token, repo, path, revision)
+    vim.fn.chansend(vim.b[buf].terminal_job_id, vim.json.encode({
+      version = 1,
+      session = token,
+      repo = repo,
+      path = path,
+      revision = revision,
+    }) .. "\n")
+  end
+
   test("file edit hides the float, reuses unsaved buffers and retains the job", function()
     api.nvim_win_set_buf(origin, origin_buf)
     local target = vim.fn.bufadd(edit_target)
@@ -472,6 +547,273 @@ local ok, err = xpcall(function()
     api.nvim_win_set_buf(origin, origin_buf)
   end)
 
+  test("file history opens read-only revision buffers and preserves unsaved files", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    vim.o.hidden = true
+    local working_path = history_repo .. "/src/user.ts"
+    local working_buf = vim.fn.bufadd(working_path)
+    vim.fn.bufload(working_buf)
+    api.nvim_win_set_buf(origin, working_buf)
+    api.nvim_buf_set_lines(working_buf, 0, -1, false, { "unsaved working content" })
+    local disk_before = vim.fn.readfile(working_path)
+    local status_before = run_git(history_repo, { "status", "--porcelain" })
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token, term_win = record()[1], api.nvim_get_current_win()
+    revision_request(term, token, history_repo, "src/user.ts", revision_one)
+    wait_for(function() return vim.b[api.nvim_get_current_buf()].igit_revision ~= nil end)
+    local revision_one_buf = api.nvim_get_current_buf()
+    local revision_one_name = api.nvim_buf_get_name(revision_one_buf)
+    equal(api.nvim_get_current_win(), origin)
+    assert(not api.nvim_win_is_valid(term_win), "Revision viewing must hide the float")
+    equal(api.nvim_buf_get_lines(revision_one_buf, 0, -1, false), { "export const user = 'first';" })
+    equal(vim.bo[revision_one_buf].buftype, "nofile")
+    equal(vim.bo[revision_one_buf].buflisted, true)
+    equal(vim.bo[revision_one_buf].swapfile, false)
+    equal(vim.bo[revision_one_buf].readonly, true)
+    equal(vim.bo[revision_one_buf].modifiable, false)
+    equal(vim.bo[revision_one_buf].modified, false)
+    equal(vim.bo[revision_one_buf].endofline, true)
+    equal(vim.bo[revision_one_buf].filetype, "typescript")
+    assert(not pcall(api.nvim_buf_set_lines, revision_one_buf, 0, -1, false, { "replacement" }))
+    equal(api.nvim_buf_get_lines(revision_one_buf, 0, -1, false), { "export const user = 'first';" })
+    assert(revision_one_name:find(revision_one, 1, true), "The buffer identity must include the full revision")
+    equal(vim.fn.fnamemodify(revision_one_name, ":t"), "user.ts (" .. revision_one:sub(1, 8) .. ")")
+    equal(vim.b[revision_one_buf].igit_revision, {
+      repo = history_repo,
+      path = "src/user.ts",
+      revision = revision_one,
+      title = "user.ts (" .. revision_one:sub(1, 8) .. ")",
+    })
+    equal(api.nvim_buf_get_lines(working_buf, 0, -1, false), { "unsaved working content" })
+    equal(vim.bo[working_buf].modified, true)
+    equal(vim.fn.readfile(working_path), disk_before)
+    equal(run_git(history_repo, { "status", "--porcelain" }), status_before)
+    equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+
+    equal(igit.open(), term)
+    vim.b[revision_one_buf].revision_test_marker = true
+    vim.bo[revision_one_buf].modifiable = true
+    vim.bo[revision_one_buf].readonly = false
+    revision_request(term, token, history_repo, "src/user.ts", revision_one)
+    wait_for(function() return api.nvim_get_current_buf() == revision_one_buf end)
+    equal(vim.b[revision_one_buf].revision_test_marker, true)
+    equal(vim.bo[revision_one_buf].modifiable, false)
+    equal(vim.bo[revision_one_buf].readonly, true)
+
+    equal(igit.open(), term)
+    revision_request(term, token, history_repo, "src/user.ts", revision_two)
+    wait_for(function()
+      local buf = api.nvim_get_current_buf()
+      return vim.b[buf].igit_revision and vim.b[buf].igit_revision.revision == revision_two
+    end)
+    local revision_two_buf = api.nvim_get_current_buf()
+    assert(revision_two_buf ~= revision_one_buf)
+    equal(api.nvim_buf_get_lines(revision_two_buf, 0, -1, false), {
+      "export const user = 'second';",
+      "// 中文",
+    })
+    equal(vim.fn.fnamemodify(api.nvim_buf_get_name(revision_two_buf), ":t"), "user.ts (" .. revision_two:sub(1, 8) .. ")")
+    equal(igit.open(), term)
+    assert(igit.close())
+    equal(api.nvim_get_current_win(), origin)
+    equal(api.nvim_win_get_buf(origin), revision_two_buf)
+    vim.bo[working_buf].modified = false
+    api.nvim_win_set_buf(origin, origin_buf)
+    api.nvim_buf_delete(working_buf, { force = true })
+  end)
+
+  test("revision buffers preserve CRLF, mixed endings, missing final newline and empty blobs", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token = record()[1]
+    for _, case in ipairs(newline_cases) do
+      equal(igit.open(), term)
+      revision_request(term, token, history_repo, case.path, asset_revision)
+      wait_for(function()
+        local metadata = vim.b[api.nvim_get_current_buf()].igit_revision
+        return metadata and metadata.path == case.path
+      end)
+      local buf = api.nvim_get_current_buf()
+      local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
+      equal(lines, case.lines, case.path)
+      equal(vim.bo[buf].fileformat, case.format, case.path)
+      equal(vim.bo[buf].endofline, case.eol, case.path)
+      equal(vim.bo[buf].fixendofline, false, case.path)
+      local separator = vim.bo[buf].fileformat == "dos" and "\r\n" or "\n"
+      local reconstructed = table.concat(lines, separator) .. (vim.bo[buf].endofline and separator or "")
+      equal(reconstructed, case.content, "Revision bytes changed for " .. case.path)
+    end
+    api.nvim_win_set_buf(origin, origin_buf)
+  end)
+
+  test("revision view keeps an IGit split and can be revisited", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    igit.setup({ command = revision_bridge, window = { layout = "right" } })
+    local term = assert(igit.open())
+    local token, term_win = record()[1], api.nvim_get_current_win()
+    revision_request(term, token, history_repo, "src/user.ts", revision_two)
+    wait_for(function()
+      local buf = api.nvim_get_current_buf()
+      return vim.b[buf].igit_revision and vim.b[buf].igit_revision.revision == revision_two
+    end)
+    equal(api.nvim_get_current_win(), origin)
+    assert(api.nvim_win_is_valid(term_win) and api.nvim_win_get_buf(term_win) == term)
+    equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+    api.nvim_win_set_buf(origin, origin_buf)
+    igit.close()
+  end)
+
+  test("invalid revision requests and non-file blobs stay inside IGit", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token, term_win = record()[1], api.nvim_get_current_win()
+    local buffer_count = #api.nvim_list_bufs()
+    revision_request(term, "foreign-session", history_repo, "src/user.ts", revision_one)
+    revision_request(term, token, "relative/repo", "src/user.ts", revision_one)
+    revision_request(term, token, history_repo, "../outside.ts", revision_one)
+    revision_request(term, token, history_repo, "src/user.ts", revision_one:sub(1, 7))
+    vim.fn.chansend(vim.b[term].terminal_job_id, "not-json\n")
+    vim.wait(100, function() return false end)
+    equal(api.nvim_get_current_win(), term_win)
+    equal(#notices, 0)
+    equal(#api.nvim_list_bufs(), buffer_count)
+
+    local function expect_failure(repo, path, revision, message)
+      local notice_count = #notices
+      revision_request(term, token, repo, path, revision)
+      wait_for(function() return #notices > notice_count end)
+      assert(notices[#notices].message:find(message, 1, true), notices[#notices].message)
+      equal(api.nvim_get_current_win(), term_win)
+    end
+    expect_failure(history_repo, "src/missing.ts", revision_one, "Could not show file revision")
+    expect_failure(history_repo .. "/missing", "src/user.ts", revision_one, "repository is unavailable")
+    expect_failure(history_repo, "binary.dat", asset_revision, "binary data")
+    expect_failure(history_repo, "invalid-utf8.dat", asset_revision, "not valid UTF-8")
+    expect_failure(history_repo, "large.txt", asset_revision, "512 KiB")
+    expect_failure(history_repo, "vendor/module", submodule_revision, "not a file")
+    equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+    igit.close()
+  end)
+
+  test("renamed and deleted working files retain historical revision views", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    equal(vim.fn.filereadable(history_repo .. "/src/rename-me.ts"), 0)
+    equal(vim.fn.filereadable(history_repo .. "/src/renamed-away.ts"), 1)
+    equal(vim.fn.filereadable(history_repo .. "/src/deleted.ts"), 0)
+    local status_before = run_git(history_repo, { "status", "--porcelain" })
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token, term_win = record()[1], api.nvim_get_current_win()
+    revision_request(term, token, history_repo, "src/rename-me.ts", revision_one)
+    wait_for(function()
+      local metadata = vim.b[api.nvim_get_current_buf()].igit_revision
+      return metadata and metadata.path == "src/rename-me.ts"
+    end)
+    equal(api.nvim_get_current_win(), origin)
+    assert(not api.nvim_win_is_valid(term_win))
+    local renamed_buf = api.nvim_get_current_buf()
+    equal(api.nvim_buf_get_lines(renamed_buf, 0, -1, false), { "original rename" })
+    equal(vim.fn.fnamemodify(api.nvim_buf_get_name(renamed_buf), ":t"), "rename-me.ts (" .. revision_one:sub(1, 8) .. ")")
+    equal(vim.bo[renamed_buf].filetype, "typescript")
+
+    equal(igit.open(), term)
+    revision_request(term, token, history_repo, "src/deleted.ts", revision_one)
+    wait_for(function()
+      local metadata = vim.b[api.nvim_get_current_buf()].igit_revision
+      return metadata and metadata.path == "src/deleted.ts"
+    end)
+    local deleted_buf = api.nvim_get_current_buf()
+    equal(api.nvim_buf_get_lines(deleted_buf, 0, -1, false), { "deleted later" })
+    assert(deleted_buf ~= renamed_buf)
+    equal(vim.fn.filereadable(history_repo .. "/src/rename-me.ts"), 0)
+    equal(vim.fn.filereadable(history_repo .. "/src/deleted.ts"), 0)
+    equal(run_git(history_repo, { "status", "--porcelain" }), status_before)
+    equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+    igit.close()
+    assert(api.nvim_win_is_valid(origin))
+    api.nvim_win_set_buf(origin, origin_buf)
+  end)
+
+  test("blocked revision switches and delayed requests preserve editor focus", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    vim.o.hidden = false
+    api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "unsaved source" })
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token, term_win = record()[1], api.nvim_get_current_win()
+    revision_request(term, token, history_repo, "src/user.ts", revision_one)
+    wait_for(function() return #notices > 0 end)
+    assert(notices[#notices].message:find("Could not show file revision", 1, true), vim.inspect(notices))
+    equal(api.nvim_get_current_win(), term_win)
+    equal(api.nvim_buf_get_lines(origin_buf, 0, -1, false), { "unsaved source" })
+    equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+    vim.o.hidden = true
+    vim.bo[origin_buf].modified = false
+    api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "test" })
+    vim.bo[origin_buf].modified = false
+
+    local sequence = "\027]51;igit-show-revision;" .. vim.json.encode({
+      version = 1,
+      session = token,
+      repo = history_repo,
+      path = "src/user.ts",
+      revision = revision_one,
+    }) .. "\a"
+    api.nvim_exec_autocmds("TermRequest", { group = "Igit", buffer = term, data = sequence })
+    igit.close()
+    vim.wait(200, function() return false end)
+    equal(api.nvim_get_current_buf(), origin_buf)
+    equal(#notices, 1)
+  end)
+
+  test("an in-flight revision request cannot open after hide and reopen", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    local real_git = vim.fn.exepath("git")
+    local old_path = vim.env.PATH or ""
+    local marker = temp .. "/slow git started"
+    local slow_directory = temp .. "/slow git bin"
+    vim.fn.mkdir(slow_directory, "p")
+    local slow_git = slow_directory .. "/git"
+    vim.fn.writefile({
+      '#!/bin/sh',
+      '[ "$GIT_OPTIONAL_LOCKS" = "0" ] && [ "$GIT_NO_LAZY_FETCH" = "1" ] || exit 24',
+      'if [ "$1" = "-C" ] && [ "$3" = "cat-file" ]; then',
+      '  printf "started\\n" >> "$IGIT_TEST_SLOW_MARKER"',
+      '  sleep 0.3',
+      'fi',
+      'exec "$IGIT_TEST_REAL_GIT" "$@"',
+    }, slow_git)
+    vim.fn.setfperm(slow_git, "rwx------")
+    vim.env.IGIT_TEST_REAL_GIT = real_git
+    vim.env.IGIT_TEST_SLOW_MARKER = marker
+    vim.env.PATH = slow_directory .. ":" .. old_path
+    igit.setup({ command = revision_bridge })
+    local term = assert(igit.open())
+    local token = record()[1]
+    revision_request(term, token, history_repo, "src/user.ts", asset_revision)
+    wait_for(function() return vim.fn.filereadable(marker) == 1 end, "Slow Git request did not start")
+    assert(igit.close())
+    equal(igit.open(), term)
+    local reopened_win = api.nvim_get_current_win()
+    vim.wait(600, function() return false end)
+    equal(api.nvim_get_current_win(), reopened_win)
+    equal(api.nvim_get_current_buf(), term)
+    equal(#notices, 0)
+    for _, buf in ipairs(api.nvim_list_bufs()) do
+      local metadata = vim.b[buf].igit_revision
+      assert(not metadata or metadata.repo ~= history_repo
+        or metadata.path ~= "src/user.ts" or metadata.revision ~= asset_revision)
+    end
+    vim.env.PATH = old_path
+    vim.env.IGIT_TEST_REAL_GIT = nil
+    vim.env.IGIT_TEST_SLOW_MARKER = nil
+    igit.close()
+    api.nvim_win_set_buf(origin, origin_buf)
+  end)
+
   test("malformed, foreign and delayed edit requests cannot steal editor focus", function()
     api.nvim_win_set_buf(origin, origin_buf)
     igit.setup({ command = bridge })
@@ -488,9 +830,15 @@ local ok, err = xpcall(function()
     equal(api.nvim_get_current_win(), win)
     assert(not api.nvim_buf_is_valid(vim.fn.bufnr(temp .. "/missing.txt")))
     igit.close()
-    edit_request(buf, token, edit_target)
+    local delayed_target = temp .. "/delayed edit target.txt"
+    vim.fn.writefile({ "must remain unopened" }, delayed_target)
+    vim.bo[origin_buf].buflisted = false
+    edit_request(buf, token, delayed_target)
     vim.wait(50, function() return false end)
     equal(api.nvim_get_current_buf(), origin_buf)
+    equal(vim.fn.bufnr(delayed_target), -1, "Delayed edit must not create a buffer")
+    equal(vim.bo[origin_buf].buflisted, false, "Delayed edit must not relist the source")
+    vim.bo[origin_buf].buflisted = true
   end)
 
   test("lowercase abbreviation is interactive and preserves other contexts", function()
