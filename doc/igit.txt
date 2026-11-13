@@ -1,4 +1,4 @@
-*igit.txt*                   Native IGit inside Neovim
+*igit.txt*                   Git editor tools and native IGit inside Neovim
 
 ==============================================================================
 CONTENTS                                                       *igit.nvim*
@@ -6,6 +6,11 @@ CONTENTS                                                       *igit.nvim*
     Requirements ......................................... |igit-requirements|
     Commands ............................................. |igit-commands|
     Configuration ........................................ |igit-configuration|
+    Hunk signs and actions ............................... |igit-hunks|
+    Git status API ....................................... |igit-status|
+    File and inline blame ................................ |igit-blame|
+    Browser links ........................................ |igit-browse|
+    Current-file diff .................................... |igit-diff|
     Lua API .............................................. |igit-api|
     Sessions ............................................. |igit-sessions|
     Edit working files ................................... |igit-edit-file|
@@ -15,9 +20,11 @@ CONTENTS                                                       *igit.nvim*
 ==============================================================================
 REQUIREMENTS                                                *igit-requirements*
 
-Neovim 0.10 or newer and an IGit executable supporting panel commands, native
-file history, and revision viewing. IGit is installed separately. No Lua
-dependencies are required.
+Neovim 0.10 or newer and Git. Editor hunk, blame, and browser features do not
+require an IGit executable or Lua dependencies. Terminal panels additionally
+require IGit supporting panel commands, native file history, and revision
+viewing. The current-file diff requires native diff command support. IGit is
+installed separately.
 
 ==============================================================================
 COMMANDS                                                        *igit-commands*
@@ -33,8 +40,27 @@ COMMANDS                                                        *igit-commands*
     For a literal file named %, use ./%. Unsaved buffer edits are not included.
     The executable receives: igit log -- {absolute-file-path}
 
+:Igit diff                                                         *:Igit-diff*
+:IgitDiff                                                         *:IgitDiff*
+    Open a side-by-side diff of the current working file against HEAD in a
+    floating native viewer. Includes unsaved buffer text. See |igit-diff|.
+
 :IgitClose                                                       *:IgitClose*
-    Hide the current IGit window and return focus. Its process keeps running.
+    Hide the current IGit window and return focus. Its process keeps running,
+    except for a current-file diff, which is finalized first.
+
+:Igit hunk [next|prev|preview|stage|unstage|reset]
+    Run a hunk action in the current working file. See |igit-hunks|.
+
+:Igit file [stage|unstage|reset]
+    Run a whole-file index or buffer action. See |igit-hunks|.
+
+:Igit blame [file|inline]
+    Toggle file annotations (default) or current-line blame. See |igit-blame|.
+
+:Igit browse
+    Open the current file on its Git hosting provider at the cursor line or
+    Ex range. See |igit-browse|.
 
 The interactive lowercase spelling :igit is a |:cnoreabbrev|, because Neovim
 requires user-command names to begin with an uppercase letter. It expands at
@@ -56,6 +82,11 @@ Setup is optional. Defaults: >lua
         layout = "float",
         border = "rounded",
       },
+      diff = {
+        width = 0.95,
+        height = 0.9,
+        border = "rounded",
+      },
     })
 <
 command       An executable path, argv list, or function returning either.
@@ -69,10 +100,17 @@ window.width  Fraction between 0 and 1, or a positive integer column count.
 window.height Fraction between 0 and 1, or a positive integer row count.
               Defaults to 85% for floats and 40% for bottom splits.
 window.border Floating border, as accepted by |nvim_open_win()|.
+diff.width    Fraction between 0 and 1, or a positive integer column count for
+              the current-file diff. Defaults to 95% of the editor width.
+diff.height   Fraction between 0 and 1, or a positive integer row count for the
+              current-file diff. Defaults to 90% of the editor height.
+diff.border   Border for the current-file diff. Defaults to window.border.
 
 Tabs fill their tab page. Splits use only the relevant dimension. Floats and
 splits respond to editor resize. Setup replaces the previous configuration
 with defaults plus supplied values, without stopping running processes.
+File diff always uses a float, regardless of window.layout or a per-opening
+layout option.
 
 For local development, use the built binary: >lua
     require("igit").setup({
@@ -86,6 +124,307 @@ Extra executable arguments use a list, for example: >lua
         "--bin", "igit", "--" },
     })
 <
+==============================================================================
+HUNK SIGNS AND ACTIONS                                         *igit-hunks*
+
+Hunk signs are enabled by default. Keep 'signcolumn' enabled to display them.
+The buffer is compared with the index for unstaged changes; the index is
+compared with HEAD for staged changes. Unsaved edits are included. >lua
+    require("igit").setup({
+      hunks = {
+        enabled = true,
+        debounce = 150,
+        signs = { add = "│", change = "│", delete = "_" },
+        colors = {
+          add = "#549159", change = "#375FAD", delete = "#868A91",
+        },
+        staged_signs = true,
+        priority = 6,
+        max_file_size = 1024 * 1024,
+      },
+    })
+<
+Default colors follow IntelliJ IDEA's Dark editor gutter: additions are green
+(#549159), modifications are blue (#375FAD), and deletions are gray (#868A91).
+Icons must occupy one or two display cells; colors use #RRGGBB. Highlight
+groups are IgitHunkAdd, IgitHunkChange, IgitHunkDelete, and their Staged variants
+(for example IgitHunkStagedAdd). Unstaged signs take priority on overlap.
+
+:IgitNextHunk                                               *:IgitNextHunk*
+:IgitPrevHunk                                               *:IgitPrevHunk*
+    Jump through staged and unstaged hunks, wrapping at either end. Counts
+    apply when invoked through a Lua mapping.
+
+:IgitPreviewHunk                                         *:IgitPreviewHunk*
+    Open a read-only floating diff for the unstaged or staged hunk under the
+    cursor. The preview reuses the cached snapshot and does not run Git.
+    Press q or Esc to close it without changing the source window.
+
+:IgitStageHunk                                             *:IgitStageHunk*
+    Stage the current unstaged hunk, including unsaved buffer content. With an
+    Ex range or active Visual selection, stage the selected buffer lines.
+
+:IgitUnstageHunk                                         *:IgitUnstageHunk*
+    Restore the current staged hunk to HEAD. Staged line positions are mapped
+    through the buffer's unstaged edits. A range is rejected if unstaged
+    deletions make its index mapping ambiguous.
+
+:IgitResetHunk                                             *:IgitResetHunk*
+    Restore the current unstaged hunk from the index into the buffer. A range
+    replaces only selected buffer lines. Undo normally with u; save normally to
+    update the working file.
+
+:IgitStageFile                                             *:IgitStageFile*
+    Stage the complete current buffer contents in the real index. Other staged
+    files and their index entries are unchanged.
+
+:IgitUnstageFile                                         *:IgitUnstageFile*
+    Restore the current file's index entry to HEAD. The buffer and disk file are
+    unchanged. A new empty file removes its index entry when unstaged.
+
+:IgitResetFile                                             *:IgitResetFile*
+    Replace the buffer with the current index as one undoable change. Disk and
+    index are unchanged.
+
+:IgitSelectHunk                                           *:IgitSelectHunk*
+    Select the hunk under the cursor as a linewise Visual range.
+
+Visual and Operator-pending text object: >lua
+    vim.keymap.set({"x", "o"}, "ih", function()
+      require("igit").select_hunk()
+    end)
+<
+This supports vih, yih, dih, and cih. The object uses the unstaged hunk first,
+then a staged hunk. Deletion-only hunks have no buffer text and are not selected;
+this prevents dih from deleting an unrelated adjacent line.
+
+Characterwise, linewise, and blockwise Visual selections all use their line
+range. Partial additions inside a larger replacement are not expanded to the
+full hunk. Selecting every visible line of a replacement applies the complete
+replacement, including old lines with no separately selectable buffer text.
+Deletion-only hunks cannot be represented by a nonempty range; use the cursor
+hunk action, preview, or a whole-file action. >lua
+    local igit = require("igit")
+    igit.stage_hunk({ 20, 28 })
+    igit.unstage_hunk({ start = 20, finish = 28 })
+    igit.reset_hunk({ 20, 28 })
+<
+
+Stage and unstage modify only the index, leaving other hunks and files intact.
+Reset modifies only the buffer. Binary files, conflicted index entries,
+symlinks, submodules, and files above max_file_size do not support actions.
+Actions require UTF-8 and reject filter, working-tree-encoding, and ident
+attributes.
+Metadata-only changes, including executable bits, belong in Commit.
+
+Git directory notifications and editor save/focus events refresh external
+changes. Reads are debounced and obsolete results are discarded. The User
+event IgitChanged refreshes editor features after plugin writes.
+
+Lua actions: >lua
+    local igit = require("igit")
+    igit.next_hunk()
+    igit.prev_hunk()
+    igit.preview_hunk()
+    igit.stage_hunk()
+    igit.unstage_hunk()
+    igit.reset_hunk()
+    igit.stage_file()
+    igit.unstage_file()
+    igit.reset_file()
+    igit.select_hunk()
+<
+No default key mappings are installed.
+
+==============================================================================
+GIT STATUS API                                                  *igit-status*
+
+require("igit").status(bufnr) returns the cached status for a buffer without
+running Git. The cache updates asynchronously on buffer entry/save, Git index
+and HEAD notifications, focus changes, and hunk refreshes. Statusline rendering
+is therefore synchronous and does not spawn Git.
+
+>lua
+    require("igit").setup({
+      status = { enabled = true, debounce = 100 },
+    })
+<
+The result contains: >lua
+    {
+      repo = "/repo", root = "/repo", gitdir = "/repo/.git",
+      path = "src/file.lua",
+      branch = "main", head = "main", oid = "...",
+      detached = false, unborn = false, in_head = true,
+      index_status = ".", worktree_status = "M",
+      file_state = "modified", untracked = false, ignored = false,
+      conflicted = false,
+      clean = false, modified = true,
+      staged_changes = false, unstaged_changes = true,
+      unstaged = { added = 1, changed = 2, removed = 0 },
+      staged = { added = 0, changed = 1, removed = 0 },
+      -- Top-level added/changed/removed mirror the unstaged counts.
+    }
+<
+The result also includes buffer_modified and a monotonically increasing
+generation used by render caches. Detached HEAD uses an eight-character commit
+id as branch; an unborn branch keeps its branch name and sets unborn=true.
+file_state is clean, modified, added, ignored, or conflicted. The line counts
+are published by the hunk engine; when hunks.enabled=false, the branch, path,
+and file-state flags remain accurate and the counts stay zero. Non-repository
+buffers return nil.
+
+When the cached view changes, the plugin emits User IgitUpdated with data.buf
+and data.status. IgitChanged is separate and requests hunk rereads. Statusline
+and tabline components should consume the cache synchronously and redraw on
+IgitUpdated. >lua
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "IgitUpdated",
+      callback = function(event)
+        -- Refresh a cached statusline component.
+      end,
+    })
+<
+
+==============================================================================
+FILE AND INLINE BLAME                                         *igit-blame*
+
+:IgitBlame                                                     *:IgitBlame*
+    Toggle a read-only left annotation split with each line's date and author.
+    Background colors indicate age. Scrolling and cursor movement follow the
+    source; closing annotations restores the source window options.
+
+:IgitInlineBlame                                         *:IgitInlineBlame*
+    Toggle blame for the current line, at EOL or in a statusline component.
+
+Blame uses live buffer contents, including unsaved edits. Lines without a
+commit display exactly "Uncommitted changes". Results are cached; cursor
+movement does not start a new Git blame process. >lua
+    require("igit").setup({
+      blame = {
+        inline = {
+          enabled = false,
+          position = "eol",
+          format = "{author}, {date}: {summary}",
+          date_format = "%Y-%m-%d",
+          delay = 250,
+        },
+        file = {
+          format = "{date} {author}",
+          date_format = "%Y/%m/%d",
+          width = "auto",
+        },
+      },
+    })
+<
+Format fields: {author}, {date}, {summary}, {sha} (eight characters), {email}.
+Dates use os.date formats. inline.position is "eol" or "statusline".
+file.width defaults to "auto", which uses the widest formatted annotation row.
+Set it to a positive integer to use a fixed width.
+
+blame.colors accepts age1 through age5 and uncommitted background colors.
+Age groups are older than 365 days, <=365, <=90, <=30, and <=7 days
+respectively. Corresponding highlight groups: IgitBlameAge1 through
+IgitBlameAge5, IgitBlameUncommitted. IgitBlameInline links to Comment.
+
+For statusline mode, add this component to the existing statusline: >lua
+    vim.opt.statusline:append(
+      " %{%v:lua.require'igit'.blame_statusline()%}")
+<
+Or use require("igit").blame_statusline as a statusline plugin component.
+The plugin does not replace the configured 'statusline'.
+
+Lua: >lua
+    require("igit").file_blame()
+    require("igit").toggle_inline_blame()
+    require("igit").blame_statusline()
+<
+==============================================================================
+BROWSER LINKS                                                *igit-browse*
+
+:[range]IgitBrowse                                             *:IgitBrowse*
+    Open the current file on its Git hosting provider. Uses the cursor line,
+    or the range when supplied, for example :10,20IgitBrowse.
+
+There is one browser action: open the current file at the relevant line. There
+are no separate branch-only or file-only commands.
+
+The current branch's upstream remote and branch take priority, then origin or
+the sole remote. Detached HEAD uses a commit hash. Local file paths determine
+repository scope, including worktrees and nested repositories.
+
+GitHub, GitLab, and Bitbucket Cloud support file and line-range URLs.
+Configure custom hosting domains explicitly: >lua
+    require("igit").setup({
+      browse = {
+        remote = "origin",
+        hosts = { ["git.example.com"] = "gitlab" },
+      },
+    })
+<
+remote is optional; omit it for automatic selection. hosts values are github,
+gitlab, or bitbucket. browse.open can be a function accepting the URL, instead
+of the default vim.ui.open.
+
+SSH and HTTP(S) remote URLs are converted to web links without credentials.
+Local filesystem and unsupported hosting URLs report an error. Paths and refs
+are URL-encoded. GitHub and GitLab links include ?plain=1, so rendered files
+such as Markdown open in source view and line anchors can select the requested
+line. Browsing does not publish local changes; unpushed content and unsaved line
+numbers may differ from the remote file.
+
+Lua: >lua
+    require("igit").browse()
+    require("igit").browse({ line = 10, end_line = 20 })
+<
+==============================================================================
+CURRENT-FILE DIFF                                               *igit-diff*
+
+:Igit diff, :IgitDiff, and require("igit").file_diff() open a side-by-side
+viewer for the current file against HEAD. A matching native IGit build is
+required. The plugin captures the source buffer and cursor line before opening
+the terminal, then starts: >
+    igit diff --line {positive-1-based-line} -- {absolute-file-path}
+<
+The native viewer centers the requested line initially. It provides n and p
+change navigation, L or Apply/» to restore the current aligned group, A or All
+for a reviewed full restore, and Tab for side switching, folding, and search.
+The complete current change group is marked in both panes and the toolbar
+reports its position. Press u or U to undo the latest L/A restore without
+closing the viewer; consecutive undos walk backward through this session.
+
+The plugin writes the live buffer, including unsaved edits, to a private UTF-8
+snapshot and sets IGIT_DIFF_BUFFER to its absolute path. The snapshot uses the
+source buffer's LF or CRLF layout. Native hunk restores write only that snapshot.
+A restore can change its BOM or final-newline state when it rebuilds the first
+or last hunk, including restoring an untracked buffer to empty. The import
+accepts those changes, keeps the source fileformat, and applies the resulting
+BOM and final-newline metadata. Without IGIT_DIFF_BUFFER, native IGit edits the
+working file with its normal guards.
+
+On a successful q, Esc, or Close exit, :IgitClose, or window close, a changed
+snapshot is imported into the source buffer as one undoable change; u and redo
+also restore the imported BOM and final-newline metadata. The import does not
+save the buffer, modify the Git index, or stage the file. A stale import is
+refused when the source buffer name, changedtick, encoding, fileformat,
+line-ending options, or modifiability no longer match. If the source changed or
+disappeared, the restored text is placed in a listed recovery scratch buffer and
+a notification identifies it; the original buffer is not overwritten.
+
+Each diff invocation creates a fresh snapshot and viewer session, including
+after the previous viewer was hidden. Private snapshot files are removed after
+import or abort. A corrupt snapshot is retained for manual recovery. Reopening
+a diff while one is active first imports and closes the previous viewer.
+
+The diff is always a float. Configure its dimensions with diff.width,
+diff.height, and diff.border in |igit-configuration|, or pass a window override
+to file_diff()/open(). Lua: >lua
+    require("igit").file_diff()
+    require("igit").file_diff({ window = { width = 80, height = 20 } })
+    require("igit").open("diff")
+<
+The source must be a named, loaded, UTF-8 working buffer with LF or CRLF line
+endings and no binary content.
+
 ==============================================================================
 EDIT WORKING FILES                                            *igit-edit-file*
 
@@ -160,6 +499,7 @@ require("igit").setup({options})
 require("igit").open({panel}, {options})
     Both arguments are optional. Panel defaults to "commit". Returns the
     terminal buffer number, or nil and an error string with a notification.
+    Panel "diff" opens the current-file viewer.
 
     Options:
       file    File path, only with the log panel. "%" uses the source buffer.
@@ -172,9 +512,42 @@ require("igit").open({panel}, {options})
           window = { layout = "right", width = 70 },
         })
 <
+require("igit").file_diff({options})
+    Open the current file's diff against HEAD. Equivalent to
+    require("igit").open("diff", {options}). See |igit-diff|.
+
+require("igit").next_hunk()
+require("igit").prev_hunk()
+    Navigate staged and unstaged hunks. Counts work from Lua mappings.
+
+require("igit").preview_hunk()
+    Preview the hunk under the cursor in a read-only floating diff without
+    moving focus or running another Git command.
+
+require("igit").stage_hunk({range})
+require("igit").unstage_hunk({range})
+require("igit").reset_hunk({range})
+    Act on the cursor hunk, or on a {start, finish} / {start=, finish=} line
+    range. Active Visual selections are captured automatically. See
+    |igit-hunks|.
+
+require("igit").stage_file()
+require("igit").unstage_file()
+require("igit").reset_file()
+    Stage, unstage, or reset the complete current file. Only the current file's
+    index entry is changed by stage/unstage; reset changes only the buffer.
+
+require("igit").select_hunk()
+    Select the hunk under the cursor for an ih text-object mapping.
+
+require("igit").status({bufnr})
+    Return the cached status table for a buffer, or nil when it is not a Git
+    working file. This call never starts Git. See |igit-status|.
+
 require("igit").close()
-    Hide the managed IGit window without stopping its process. Returns true
-    if a window was hidden, false otherwise.
+    Hide the managed IGit window without stopping its process. A current-file
+    diff is imported, finalized, and stopped. Returns true if a window was
+    hidden, false otherwise.
 
 ==============================================================================
 SESSIONS                                                        *igit-sessions*
@@ -192,7 +565,9 @@ IGit terminal buffers are listed in :buffers. :IgitClose and normal window
 closing preserve the running job. Quit normally inside IGit to finish; a zero
 exit status cleans up the terminal. A nonzero exit leaves its output available,
 reports the exit code, and permits a new launch. Use :bdelete! to explicitly
-stop and remove a terminal buffer.
+stop and remove a terminal buffer. Current-file diff sessions are one-shot:
+hiding one imports its snapshot, ends the viewer process, and removes temporary
+files. Reopening always starts a new snapshot and session.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:

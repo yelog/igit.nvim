@@ -5,13 +5,19 @@ local defaults = {
   command = "igit",
   command_alias = true,
   window = { layout = "float", border = "rounded" },
+  diff = { width = 0.95, height = 0.9 },
+  hunks = {},
+  status = {},
+  blame = {},
+  browse = {},
 }
 local config = vim.deepcopy(defaults)
-local panels = { commit = true, log = true, push = true, branch = true, stash = true }
+local panels = { commit = true, log = true, push = true, branch = true, stash = true, diff = true }
 local layouts = { float = true, left = true, right = true, bottom = true, tab = true }
 local sessions, buffers = {}, {}
 local active
 local initialized = false
+local editor_initialized = false
 
 local function report(message)
   vim.notify(message, vim.log.levels.ERROR, { title = "igit.nvim" })
@@ -27,6 +33,18 @@ local function validate_window(window)
       "igit.nvim: window." .. name .. " must be a fraction between 0 and 1 or a positive cell count")
   end
   assert(type(window.border) == "string" or type(window.border) == "table", "igit.nvim: window.border must be a string or table")
+end
+
+local function validate_diff(diff, window)
+  assert(type(diff) == "table", "igit.nvim: diff must be a table")
+  local candidate = {
+    layout = "float",
+    width = diff.width,
+    height = diff.height,
+    border = diff.border or window.border,
+  }
+  local valid, validation_error = pcall(validate_window, candidate)
+  assert(valid, (validation_error or "igit.nvim: invalid diff window"):gsub("window%.", "diff."))
 end
 
 local function command_argv(command)
@@ -68,6 +86,69 @@ local function source_context()
   return { win = win, buf = buf, cwd = vim.fn.getcwd() }
 end
 
+local forget
+
+local function retire(session)
+  if session.deleted then
+    return
+  end
+  local buffer, job = session.buf, session.job
+  forget(session)
+  if job then
+    pcall(vim.fn.jobstop, job)
+  end
+  vim.schedule(function()
+    if api.nvim_buf_is_valid(buffer) then
+      pcall(api.nvim_buf_delete, buffer, { force = true })
+    end
+  end)
+end
+
+local function stop_current_job(session)
+  local job = session.job
+  if not job then
+    return true
+  end
+  session.stopping_job = true
+  pcall(vim.fn.jobstop, job)
+  local waited, result = pcall(vim.fn.jobwait, { job }, 1000)
+  session.stopping_job = false
+  if not waited or type(result) ~= "table" then
+    return false
+  end
+  local code = result[1]
+  if session.exit_seen or code == -3 or (type(code) == "number" and code >= 0) then
+    session.job = nil
+    session.exited = true
+    return true
+  end
+  return false
+end
+
+local function finish_hidden(session, mode)
+  if session.hidden_notified then
+    return true
+  end
+  if session.diff and session.job and not stop_current_job(session) then
+    session.pending_finish = mode or "apply"
+    return false
+  end
+  session.hidden_notified = true
+  if session.diff then
+    local ok, error_message = pcall(session.diff.finish, mode or "apply")
+    if not ok then
+      report("Could not import diff changes: " .. tostring(error_message))
+    end
+  end
+  return true
+end
+
+local function hidden(session, mode)
+  if finish_hidden(session, mode) and session.diff then
+    retire(session)
+  end
+end
+
 local function hide(session)
   if not session then
     return false
@@ -78,6 +159,9 @@ local function hide(session)
     active = nil
   end
   if not win or not api.nvim_win_is_valid(win) or api.nvim_win_get_buf(win) ~= session.buf then
+    if session.diff then
+      hidden(session)
+    end
     return false
   end
   local focused = api.nvim_get_current_win() == win
@@ -97,10 +181,11 @@ local function hide(session)
   if focused and session.source_win and api.nvim_win_is_valid(session.source_win) then
     api.nvim_set_current_win(session.source_win)
   end
+  hidden(session)
   return true
 end
 
-local function forget(session)
+forget = function(session)
   if sessions[session.key] == session then
     sessions[session.key] = nil
   end
@@ -225,13 +310,19 @@ local function initialize()
     group = group,
     callback = function(event)
       local win = tonumber(event.match)
+      local closed
       for _, session in pairs(buffers) do
         if session.win == win then
+          closed = session
           session.win = nil
           if active == session then
             active = nil
           end
+          break
         end
+      end
+      if closed and closed.diff and not closed.hidden_notified then
+        hidden(closed)
       end
     end,
   })
@@ -240,9 +331,13 @@ local function initialize()
     callback = function(event)
       local session = buffers[event.buf]
       if session then
-        forget(session)
-        if session.job then
-          pcall(vim.fn.jobstop, session.job)
+        if session.diff then
+          hidden(session, "preserve")
+        else
+          forget(session)
+          if session.job then
+            pcall(vim.fn.jobstop, session.job)
+          end
         end
       end
     end,
@@ -259,14 +354,111 @@ function M.setup(options)
     command_argv(candidate.command)
   end
   validate_window(candidate.window)
+  validate_diff(candidate.diff, candidate.window)
   assert(type(candidate.command_alias) == "boolean", "igit.nvim: command_alias must be a boolean")
+  for _, name in ipairs({ "hunks", "status", "blame", "browse" }) do
+    assert(type(candidate[name]) == "table", "igit.nvim: " .. name .. " must be a table")
+  end
+  require("igit.hunks").setup(candidate.hunks)
+  require("igit.status").setup(candidate.status)
+  require("igit.blame").setup(candidate.blame)
+  require("igit.browse").setup(candidate.browse)
+  editor_initialized = true
   config = candidate
   initialize()
   M._register_commands()
 end
 
 function M._register_commands()
+  if not editor_initialized then
+    require("igit.hunks").setup(config.hunks)
+    require("igit.status").setup(config.status)
+    require("igit.blame").setup(config.blame)
+    require("igit.browse").setup(config.browse)
+    editor_initialized = true
+  end
   require("igit.command").register(config.command_alias)
+end
+
+function M.next_hunk()
+  return require("igit.hunks").navigate(1)
+end
+
+function M.prev_hunk()
+  return require("igit.hunks").navigate(-1)
+end
+
+function M.stage_hunk(range)
+  return require("igit.hunks").stage_hunk(range)
+end
+
+function M.unstage_hunk(range)
+  return require("igit.hunks").unstage_hunk(range)
+end
+
+function M.reset_hunk(range)
+  return require("igit.hunks").reset_hunk(range)
+end
+
+function M.preview_hunk()
+  return require("igit.hunks").preview_hunk()
+end
+
+function M.stage_file()
+  return require("igit.hunks").stage_file()
+end
+
+function M.unstage_file()
+  return require("igit.hunks").unstage_file()
+end
+
+function M.reset_file()
+  return require("igit.hunks").reset_file()
+end
+
+function M.select_hunk()
+  return require("igit.hunks").select_hunk()
+end
+
+---Return the cached Git status for a buffer without running Git.
+---@param buf? integer
+---@return table?
+function M.status(buf)
+  return require("igit.status").get(buf)
+end
+
+function M.file_blame()
+  local result, err = require("igit.blame").file_blame()
+  if err then
+    return report(err)
+  end
+  return result
+end
+
+function M.toggle_inline_blame()
+  local result, err = require("igit.blame").toggle_inline_blame()
+  if err then
+    return report(err)
+  end
+  return result
+end
+
+function M.blame_statusline(buf)
+  return require("igit.blame").statusline(buf)
+end
+
+---Open the current file on its Git hosting provider at the cursor line.
+---@param options? {buf?: integer, remote?: string, line?: integer, end_line?: integer}
+function M.browse(options)
+  return require("igit.browse").open(options)
+end
+
+---Open the current file's working-tree diff against HEAD in a floating viewer.
+---@param options? {cwd?: string, window?: table}
+---@return integer? buffer
+---@return string? error
+function M.file_diff(options)
+  return M.open("diff", options)
 end
 
 ---Open or focus an IGit terminal. Relative paths use the invoking window's cwd.
@@ -294,16 +486,40 @@ function M.open(panel, options)
   if options.window ~= nil and type(options.window) ~= "table" then
     return report("IGit window options must be a table")
   end
-  local window = vim.tbl_deep_extend("force", vim.deepcopy(config.window), options.window or {})
+  local window
+  if panel == "diff" then
+    window = vim.tbl_deep_extend("force", {
+      layout = "float",
+      width = config.diff.width,
+      height = config.diff.height,
+      border = config.diff.border or config.window.border,
+    }, options.window or {}, { layout = "float" })
+  else
+    window = vim.tbl_deep_extend("force", vim.deepcopy(config.window), options.window or {})
+  end
   local valid, validation_error = pcall(validate_window, window)
   if not valid then
     return report(validation_error)
   end
-  local source = source_context()
-  local cwd = absolute_path(options.cwd or source.cwd, source.cwd)
+  local initial_source = source_context()
+  local cwd = absolute_path(options.cwd or initial_source.cwd, initial_source.cwd)
   if vim.fn.isdirectory(cwd) ~= 1 then
     return report("IGit working directory does not exist: " .. cwd)
   end
+  local resolved, argv = pcall(command_argv, config.command)
+  if not resolved then
+    return report("Could not resolve IGit command: " .. tostring(argv))
+  end
+  if argv[1]:find("[/\\]") then
+    argv[1] = absolute_path(argv[1], initial_source.cwd)
+  end
+  if vim.fn.executable(argv[1]) ~= 1 then
+    return report("IGit executable not found: " .. argv[1] .. ". Install IGit or set setup({ command = '/path/to/igit' }).")
+  end
+  if panel == "diff" and active and active.diff then
+    hide(active)
+  end
+  local source = source_context()
   local file = options.file
   if file == "%" then
     if not source.buf or not api.nvim_buf_is_valid(source.buf) or vim.bo[source.buf].buftype ~= "" then
@@ -314,23 +530,27 @@ function M.open(panel, options)
       return report("The originating buffer has no file name")
     end
   end
-  local resolved, argv = pcall(command_argv, config.command)
-  if not resolved then
-    return report("Could not resolve IGit command: " .. tostring(argv))
-  end
-  if argv[1]:find("[/\\]") then
-    argv[1] = absolute_path(argv[1], source.cwd)
-  end
-  if vim.fn.executable(argv[1]) ~= 1 then
-    return report("IGit executable not found: " .. argv[1] .. ". Install IGit or set setup({ command = '/path/to/igit' }).")
-  end
+  local diff
   table.insert(argv, panel)
-  if file then
+  if panel == "diff" then
+    diff, validation_error = require("igit.file_diff").prepare(source)
+    if not diff then
+      return report(validation_error)
+    end
+    table.insert(argv, "--line")
+    table.insert(argv, tostring(diff.line))
+    table.insert(argv, "--")
+    table.insert(argv, diff.path)
+  elseif file then
     table.insert(argv, "--")
     table.insert(argv, absolute_path(file, cwd))
   end
   initialize()
-  local key = vim.json.encode({ cwd, argv })
+  local key_parts = { cwd, argv }
+  if diff then
+    key_parts[#key_parts + 1] = diff.id
+  end
+  local key = vim.json.encode(key_parts)
   local session = sessions[key]
   local created = not session
   if not session then
@@ -340,14 +560,24 @@ function M.open(panel, options)
       buf = buf,
       cwd = cwd,
       token = tostring(buf) .. ":" .. tostring(vim.uv.hrtime()),
+      panel = panel,
+      diff = diff,
     }
     sessions[key], buffers[session.buf] = session, session
     vim.bo[session.buf].bufhidden = "hide"
     vim.bo[session.buf].swapfile = false
-    vim.b[session.buf].igit = { panel = panel, cwd = cwd, argv = vim.deepcopy(argv) }
+    vim.b[session.buf].igit = {
+      panel = panel,
+      cwd = cwd,
+      argv = vim.deepcopy(argv),
+      diff = diff and { path = diff.path, line = diff.line },
+    }
   end
   local shown, show_error = pcall(show, session, source, window)
   if not shown then
+    if diff then
+      diff.abort()
+    end
     if created then
       dispose(session)
     end
@@ -356,9 +586,15 @@ function M.open(panel, options)
   if not created then
     return session.buf
   end
+  local env = { IGIT_NVIM_SESSION = session.token }
+  if diff then
+    for name, value in pairs(diff.env) do
+      env[name] = value
+    end
+  end
   local started, job = pcall(vim.fn.termopen, argv, {
     cwd = cwd,
-    env = { IGIT_NVIM_SESSION = session.token },
+    env = env,
     on_exit = function(_, code)
       vim.schedule(function()
         if session.deleted then
@@ -366,6 +602,16 @@ function M.open(panel, options)
         end
         session.job = nil
         session.exited = true
+        if session.stopping_job then
+          session.exit_seen = true
+          return
+        end
+        if session.pending_finish then
+          local mode = session.pending_finish
+          session.pending_finish = nil
+          hidden(session, mode)
+          return
+        end
         if code == 0 then
           dispose(session)
         else
@@ -381,6 +627,9 @@ function M.open(panel, options)
     end,
   })
   if not started or job <= 0 then
+    if diff then
+      diff.abort()
+    end
     dispose(session)
     return report("Could not start IGit: " .. tostring(job))
   end
@@ -390,7 +639,7 @@ function M.open(panel, options)
   return session.buf
 end
 
----Hide the current IGit window without stopping its process.
+---Hide the current IGit window. Current-file diff sessions are finalized first.
 ---@return boolean hidden
 function M.close()
   local session = buffers[api.nvim_get_current_buf()] or active
