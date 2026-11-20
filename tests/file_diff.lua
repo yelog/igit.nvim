@@ -82,6 +82,7 @@ git("commit", "-qm", "initial")
 
 vim.fn.writefile({
   "#!/bin/sh",
+  'if [ "$1" = "--capabilities" ]; then printf \'%s\\n\' \'{"schema_version":1,"version":"0.1.3","editor_protocol":1,"capabilities":["file-diff"]}\'; exit 0; fi',
   'printf "%s\\n" "$PWD" > "$IGIT_DIFF_RECORD"',
   'printf "%s\\n" "$@" >> "$IGIT_DIFF_RECORD"',
   'printf "%s\\n" "$IGIT_DIFF_BUFFER" >> "$IGIT_DIFF_RECORD"',

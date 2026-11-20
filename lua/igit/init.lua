@@ -139,6 +139,8 @@ local function finish_hidden(session, mode)
     if not ok then
       report("Could not import diff changes: " .. tostring(error_message))
     end
+  else
+    require("igit.sync").reconcile(session)
   end
   return true
 end
@@ -159,9 +161,7 @@ local function hide(session)
     active = nil
   end
   if not win or not api.nvim_win_is_valid(win) or api.nvim_win_get_buf(win) ~= session.buf then
-    if session.diff then
-      hidden(session)
-    end
+    hidden(session)
     return false
   end
   local focused = api.nvim_get_current_win() == win
@@ -261,6 +261,10 @@ local function show(session, source, window)
     return
   end
   hide(active)
+  session.hidden_notified = false
+  if not session.diff then
+    require("igit.sync").capture(session)
+  end
   session.source_win = source.win
   session.source_buf = source.buf
   session.window = window
@@ -291,6 +295,7 @@ local function initialize()
     return
   end
   initialized = true
+  require("igit.sync").setup()
   local group = api.nvim_create_augroup("Igit", { clear = true })
   api.nvim_create_autocmd("TermRequest", {
     group = group,
@@ -321,7 +326,7 @@ local function initialize()
           break
         end
       end
-      if closed and closed.diff and not closed.hidden_notified then
+      if closed and not closed.hidden_notified then
         hidden(closed)
       end
     end,
@@ -334,6 +339,7 @@ local function initialize()
         if session.diff then
           hidden(session, "preserve")
         else
+          hidden(session)
           forget(session)
           if session.job then
             pcall(vim.fn.jobstop, session.job)
@@ -380,12 +386,12 @@ function M._register_commands()
   require("igit.command").register(config.command_alias)
 end
 
-function M.next_hunk()
-  return require("igit.hunks").navigate(1)
+function M.next_hunk(target)
+  return require("igit.hunks").navigate(1, target)
 end
 
-function M.prev_hunk()
-  return require("igit.hunks").navigate(-1)
+function M.prev_hunk(target)
+  return require("igit.hunks").navigate(-1, target)
 end
 
 function M.stage_hunk(range)
@@ -400,8 +406,12 @@ function M.reset_hunk(range)
   return require("igit.hunks").reset_hunk(range)
 end
 
-function M.preview_hunk()
-  return require("igit.hunks").preview_hunk()
+function M.preview_hunk(target)
+  return require("igit.hunks").preview_hunk(target)
+end
+
+function M.undo_stage()
+  return require("igit.hunks").undo_stage()
 end
 
 function M.stage_file()
@@ -461,6 +471,21 @@ function M.file_diff(options)
   return M.open("diff", options)
 end
 
+function M._command(cwd)
+  local resolved, argv = pcall(command_argv, config.command)
+  if not resolved then
+    return nil, "Could not resolve IGit command: " .. tostring(argv)
+  end
+  if argv[1]:find("[/\\]") then
+    argv[1] = absolute_path(argv[1], cwd or vim.fn.getcwd())
+  end
+  if vim.fn.executable(argv[1]) ~= 1 then
+    return nil, "IGit executable not found: " .. argv[1]
+      .. ". Install IGit or set setup({ command = '/path/to/igit' })."
+  end
+  return argv
+end
+
 ---Open or focus an IGit terminal. Relative paths use the invoking window's cwd.
 ---@param panel? string
 ---@param options? {file?: string, cwd?: string, window?: table}
@@ -506,15 +531,16 @@ function M.open(panel, options)
   if vim.fn.isdirectory(cwd) ~= 1 then
     return report("IGit working directory does not exist: " .. cwd)
   end
-  local resolved, argv = pcall(command_argv, config.command)
-  if not resolved then
-    return report("Could not resolve IGit command: " .. tostring(argv))
+  local argv, command_error = M._command(initial_source.cwd)
+  if not argv then
+    return report(command_error)
   end
-  if argv[1]:find("[/\\]") then
-    argv[1] = absolute_path(argv[1], initial_source.cwd)
-  end
-  if vim.fn.executable(argv[1]) ~= 1 then
-    return report("IGit executable not found: " .. argv[1] .. ". Install IGit or set setup({ command = '/path/to/igit' }).")
+  local capabilities = require("igit.capabilities").inspect(argv, cwd)
+  if panel == "diff" then
+    local supported, capability_error = require("igit.capabilities").check(capabilities, "file-diff")
+    if not supported then
+      return report("Current-file diff is unavailable: " .. capability_error)
+    end
   end
   if panel == "diff" and active and active.diff then
     hide(active)
@@ -562,6 +588,7 @@ function M.open(panel, options)
       token = tostring(buf) .. ":" .. tostring(vim.uv.hrtime()),
       panel = panel,
       diff = diff,
+      capabilities = capabilities,
     }
     sessions[key], buffers[session.buf] = session, session
     vim.bo[session.buf].bufhidden = "hide"
@@ -570,6 +597,7 @@ function M.open(panel, options)
       panel = panel,
       cwd = cwd,
       argv = vim.deepcopy(argv),
+      capabilities = vim.deepcopy(capabilities),
       diff = diff and { path = diff.path, line = diff.line },
     }
   end
@@ -611,6 +639,10 @@ function M.open(panel, options)
           session.pending_finish = nil
           hidden(session, mode)
           return
+        end
+        if not session.diff then
+          session.hidden_notified = false
+          hidden(session)
         end
         if code == 0 then
           dispose(session)

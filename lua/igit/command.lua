@@ -4,7 +4,7 @@ local alias_owned = false
 local alias_expression = "getcmdtype() ==# ':' && getcmdline() ==# 'igit' ? 'Igit' : 'igit'"
 local panels = { "commit", "log", "push", "branch", "stash", "diff", "hunk", "file", "blame", "browse" }
 local actions = {
-  hunk = { "next", "prev", "preview", "stage", "unstage", "reset" },
+  hunk = { "next", "prev", "preview", "stage", "unstage", "reset", "undo-stage" },
   file = { "stage", "unstage", "reset" },
   blame = { "file", "inline" },
 }
@@ -38,7 +38,10 @@ local function editor_command(args, command)
     return false
   end
   local action = args[2] or (kind == "blame" and "file" or kind == "file" and "stage" or "next")
-  if #args > 2 or not vim.tbl_contains(actions[kind], action) then
+  local filtered = kind == "hunk" and (action == "next" or action == "prev" or action == "preview")
+  local targets = action == "preview" and { "staged", "unstaged" } or { "all", "staged", "unstaged" }
+  if #args > (filtered and 3 or 2) or not vim.tbl_contains(actions[kind], action)
+      or filtered and args[3] and not vim.tbl_contains(targets, args[3]) then
     vim.notify("Usage: :Igit " .. kind .. " [" .. table.concat(actions[kind], "|") .. "]",
       vim.log.levels.ERROR, { title = "igit.nvim" })
     return true
@@ -56,10 +59,14 @@ local function editor_command(args, command)
   else
     local methods = {
       next = "next_hunk", prev = "prev_hunk", preview = "preview_hunk",
-      stage = "stage_hunk", unstage = "unstage_hunk", reset = "reset_hunk",
+      stage = "stage_hunk", unstage = "unstage_hunk", reset = "reset_hunk", ["undo-stage"] = "undo_stage",
     }
     local range = command.range > 0 and { command.line1, command.line2 } or nil
-    igit[methods[action]](range)
+    if filtered then
+      igit[methods[action]](args[3])
+    else
+      igit[methods[action]](range)
+    end
   end
   return true
 end
@@ -115,6 +122,12 @@ function M.complete(lead, line, position)
     return vim.tbl_map(vim.fn.fnameescape, vim.fn.getcompletion(lead, "file"))
   end
   local kind = arguments:match("^(%S+)%s+")
+  local action = arguments:match("^hunk%s+(%S+)%s+")
+  if action == "next" or action == "prev" then
+    return filter({ "all", "staged", "unstaged" }, lead)
+  elseif action == "preview" then
+    return filter({ "staged", "unstaged" }, lead)
+  end
   if actions[kind] then
     return filter(actions[kind], lead)
   end
@@ -151,8 +164,7 @@ function M.register(enable_alias)
       require("igit").file_diff()
     end, { desc = "Diff the current file against HEAD" })
     for suffix, method in pairs({
-      NextHunk = "next_hunk", PrevHunk = "prev_hunk", StageHunk = "stage_hunk",
-      UnstageHunk = "unstage_hunk", ResetHunk = "reset_hunk", PreviewHunk = "preview_hunk",
+      StageHunk = "stage_hunk", UnstageHunk = "unstage_hunk", ResetHunk = "reset_hunk",
       SelectHunk = "select_hunk",
     }) do
       vim.api.nvim_create_user_command("Igit" .. suffix, function(command)
@@ -161,8 +173,22 @@ function M.register(enable_alias)
       end, { range = true, desc = "IGit " .. method:gsub("_", " ") })
     end
     for suffix, method in pairs({
+      NextHunk = "next_hunk", PrevHunk = "prev_hunk", PreviewHunk = "preview_hunk",
+    }) do
+      vim.api.nvim_create_user_command("Igit" .. suffix, function(command)
+        require("igit")[method](command.args ~= "" and command.args or nil)
+      end, {
+        nargs = "?",
+        complete = function(lead)
+          return filter(method == "preview_hunk" and { "staged", "unstaged" } or { "all", "staged", "unstaged" }, lead)
+        end,
+        desc = "IGit " .. method:gsub("_", " "),
+      })
+    end
+    for suffix, method in pairs({
       StageFile = "stage_file", UnstageFile = "unstage_file", ResetFile = "reset_file",
       Blame = "file_blame", InlineBlame = "toggle_inline_blame",
+      UndoStage = "undo_stage",
     }) do
       vim.api.nvim_create_user_command("Igit" .. suffix, function()
         require("igit")[method]()

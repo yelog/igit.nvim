@@ -2,7 +2,7 @@
 
 Git tools in your editing buffers and the native [IGit](https://github.com/yelog/igit) terminal workspace inside Neovim. Stage hunk ranges and whole files, select hunks with a text object, read cached branch and change status, annotate files with blame, and open Git hosting links. Open Commit, Log, Push, Branch, Stash, or a file's native history in a floating window, a left/right/bottom split, or a tab.
 
-Requires Neovim **0.10+** and Git. The editor features have no Lua dependencies and work without an IGit executable. Terminal panels and current-file diff additionally require a matching IGit build with panel, file-history, and diff command support; the plugin does not install it.
+Requires Neovim **0.10+** and Git. The editor features have no Lua dependencies and work without an IGit executable. Terminal panels require IGit; integrated editing, revisions, and current-file diff require the corresponding native capabilities. Ordinary panels can still start with an older binary. The plugin does not install IGit; use `:checkhealth igit` to inspect the selected executable.
 
 ## Install
 
@@ -28,7 +28,7 @@ For Neovim's built-in package loader, put or symlink this checkout at `~/.local/
 require("igit").setup()
 ```
 
-No setup call is required for the defaults. Load at startup or on `BufReadPre` / `BufNewFile` to see hunk signs automatically. With command-only lazy loading, use `cmd = { "Igit", "IgitClose", "IgitDiff", "IgitBlame", "IgitInlineBlame", "IgitBrowse", "IgitNextHunk", "IgitPrevHunk", "IgitPreviewHunk", "IgitStageHunk", "IgitUnstageHunk", "IgitResetHunk", "IgitSelectHunk", "IgitStageFile", "IgitUnstageFile", "IgitResetFile" }` and uppercase commands for the first invocation; the lowercase abbreviation exists only after the plugin loads.
+No setup call is required for the defaults. Load at startup or on `BufReadPre` / `BufNewFile` to see hunk signs automatically. With command-only lazy loading, use `cmd = { "Igit", "IgitClose", "IgitDiff", "IgitBlame", "IgitInlineBlame", "IgitBrowse", "IgitNextHunk", "IgitPrevHunk", "IgitPreviewHunk", "IgitStageHunk", "IgitUnstageHunk", "IgitUndoStage", "IgitResetHunk", "IgitSelectHunk", "IgitStageFile", "IgitUnstageFile", "IgitResetFile" }` and uppercase commands for the first invocation; the lowercase abbreviation exists only after the plugin loads.
 
 ## Hunk signs and actions
 
@@ -37,6 +37,12 @@ included. Staged changes have separate `IgitHunkStagedAdd`, `IgitHunkStagedChang
 and `IgitHunkStagedDelete` highlights; unstaged signs take priority where they
 overlap. Keep `signcolumn` enabled, for example `vim.opt.signcolumn = "yes"`.
 Enable `termguicolors` to use the configured RGB colors.
+
+Git-ignored, untracked files have no hunk signs or change counts. Ignore rules
+come from Git, including nested `.gitignore` files, `.git/info/exclude`,
+`core.excludesFile`, and negated patterns. Files present in the index or HEAD
+retain their normal hunks even if their paths match ignore patterns. Editor
+entry and focus refreshes recheck the rules and remove obsolete signs.
 
 The default colors follow IntelliJ IDEA's
 [Dark editor gutter](https://github.com/JetBrains/intellij-community/blob/master/platform/platform-resources/src/themes/expUI/expUI_darkScheme.xml):
@@ -64,6 +70,7 @@ require("igit").setup({
 | `:Igit hunk preview` / `:IgitPreviewHunk` | Preview the hunk under the cursor in a read-only floating diff. |
 | `:Igit hunk stage` / `:IgitStageHunk` | Stage the unstaged hunk under the cursor, including unsaved text. |
 | `:Igit hunk unstage` / `:IgitUnstageHunk` | Restore only the staged hunk under the cursor to HEAD. |
+| `:Igit hunk undo-stage` / `:IgitUndoStage` | Undo the last plugin stage or unstage action for the current path. |
 | `:Igit hunk reset` / `:IgitResetHunk` | Restore the unstaged hunk to the index in the buffer; `u` undoes the reset. |
 | `:Igit file stage` / `:IgitStageFile` | Stage the complete buffer contents for the current file. |
 | `:Igit file unstage` / `:IgitUnstageFile` | Restore the current file's index entry to HEAD. |
@@ -74,6 +81,43 @@ Actions use three distinct versions: HEAD, the real Git index, and the editing
 buffer. Stage and unstage update the index without saving the buffer or changing
 other staged files. Reset changes only the buffer; save normally to update disk.
 Staged positions follow unsaved insertions and deletions above them.
+Index writes recheck the captured buffer, index entry, HEAD, and branch before
+publication; stale inputs leave the real index unchanged.
+
+Pass `staged` or `unstaged` to preview either comparison explicitly, including
+when both cover the same line. Staged compares HEAD with the index; Unstaged
+compares the index with the editing buffer. Enter the preview and press `s` to
+switch comparisons at the same source line. Navigation accepts `all` (the
+default), `staged`, or `unstaged`:
+
+```vim
+:Igit hunk preview staged
+:IgitPreviewHunk unstaged
+:Igit hunk next staged
+:IgitPrevHunk unstaged
+```
+
+```lua
+require("igit").preview_hunk("staged")
+require("igit").next_hunk("unstaged")
+```
+
+Undo Stage restores the exact prior blob, executable mode, registration, and
+assume-unchanged/skip-worktree flags for the current path. For example, staging
+buffer C over already staged B, then running `:IgitUndoStage`, restores B and
+keeps buffer C. It also covers unstage, whole-file actions, and ranges.
+The plugin holds the Git index lock, validates the recorded post-action entry,
+and publishes only the restored path into the latest index. External changes
+to that entry refuse the undo; staging in other files is preserved. Repeated
+undos walk back this path's actions. History keeps up to 100 successful actions
+in the current Neovim process and survives buffer closure and `setup()` calls;
+it is not persisted across Neovim restarts. Unstage still restores to HEAD, and
+buffer `u` still undoes buffer edits independently.
+
+Stage and unstage also reject changes to the captured entry's flags. Undo
+verifies that the previous blob is still readable before restoring it. If Git
+garbage collection has pruned that blob, undo refuses without changing the index
+and retains its history record.
 
 The stage, unstage, and reset functions accept an optional line range. Visual
 mappings can call them directly because the active selection is captured before
@@ -109,15 +153,19 @@ end, { desc = "Select Git hunk" })
 ```
 
 Updates are debounced, with Git index notifications and editor focus/save events
-refreshing external changes. Binary files, unmerged entries, symlinks, and
-submodules do not support hunk actions. Actions require UTF-8 files and reject
-custom clean filters, `working-tree-encoding`, and `ident` attributes rather than bypassing
-their conversions.
+refreshing external changes. Ignored untracked files, binary files, unmerged
+entries, symlinks, and submodules do not support hunk or whole-file actions.
+Actions require UTF-8 files and reject custom clean filters,
+`working-tree-encoding`, and `ident` attributes rather than bypassing their
+conversions. Index writes also reject intent-to-add entries.
 The default file limit is 1 MiB. File-only metadata changes, such as executable
 bits, should be handled in the native Commit panel.
 
-`:IgitPreviewHunk` and `:Igit hunk preview` reuse the current snapshot and never
-run another Git command. `q` or `Esc` closes the preview without moving focus.
+`:IgitPreviewHunk` and `:Igit hunk preview` reuse a current snapshot; a stale
+snapshot is refreshed before opening. The preview opens without moving focus.
+Enter it to use `s` to switch comparisons, or `q` / `Esc` to close it.
+If the selected comparison has no hunk at the source line, the plugin reports
+that result and keeps the existing preview.
 
 ## Git status API
 
@@ -179,8 +227,8 @@ require("igit").setup({
     inline = {
       enabled = true,
       position = "eol", -- "eol" or "statusline"
-      format = "{author}, {date}: {summary}",
-      date_format = "%Y-%m-%d",
+      format = "{author}, {date} · {summary}",
+      date_format = "%Y/%m/%d, %H:%M",
       delay = 250,
     },
     file = {
@@ -199,6 +247,9 @@ require("igit").setup({
   },
 })
 ```
+
+Inline blame displays local commit time to the minute, for example
+`Alice, 2026/11/16, 10:49 · Update settings`.
 
 Formats support `{author}`, `{date}`, `{summary}`, `{sha}` (eight characters),
 and `{email}`. Dates use Lua's `os.date` format. Customize `IgitBlameInline` for
@@ -378,12 +429,63 @@ When omitted, floating windows use 90% of the available width and 85% of the hei
 
 Identical commands in the same working directory reuse their terminal session. Opening a different panel or file hides the old window and creates or resumes another session. This preserves drafts and running operations. `:IgitClose` or `require("igit").close()` hides the window and returns focus; the process keeps running. Reopen the same command to resume it, or use Neovim's buffer list. Use IGit's normal quit action to finish a session; a successful exit removes its terminal buffer. Failed processes leave their output available, report the exit code, and allow a fresh launch on the next invocation. `:bdelete!` explicitly stops and removes a terminal session. A current-file diff is the exception: hiding it imports any changed snapshot, ends the viewer process, and removes its temporary files.
 
+Hiding or exiting an ordinary session checks loaded working-file buffers in its
+workspace, including repositories below the launch directory and the containing
+repository when launched in a subdirectory. Clean buffers use `checktime` with
+autoread enabled for that check. Modified buffers retain their text and metadata;
+a concurrent disk change produces a warning to review before saving. A later
+exit also checks writes made while the terminal was hidden. Affected repositories
+emit `IgitChanged`, which refreshes status, signs, and blame; completed status
+reads emit `IgitUpdated`.
+Disk fingerprints hash at most 1 MiB per file; larger files use size, mode,
+identity, and modification/change timestamps. Capture and editor save hooks
+inspect only loaded files within a managed session's repository roots.
+The large-file fallback cannot detect a disk edit that preserves all of those
+metadata values.
+
 Terminal input goes directly to IGit. Use Neovim's `<C-\><C-n>` to enter Terminal-Normal mode before running editor commands. The plugin does not replace IGit's Escape or `q` keys.
+
+## Native capabilities and health
+
+Before launching a session, the plugin runs the selected executable with
+`--capabilities`, using a one-second timeout. Results are cached by executable
+path, file identity, modification time, and configured argv. Rebuilding or
+switching the executable invalidates the probe; an already running session
+keeps its original capability contract.
+
+The supported response is one JSON object, with extra future fields allowed:
+
+```json
+{"schema_version":1,"version":"0.1.3","editor_protocol":1,"capabilities":["editor","revision","file-diff","repository-events"]}
+```
+
+The application version is informational. Schema 1 and editor protocol 1 are
+required for the corresponding integrations. Missing features, invalid JSON,
+old binaries, and unsupported protocols produce diagnostics when an integrated
+action is requested. Ordinary TUI panels remain available if a capability query
+fails. `:checkhealth igit` reports the actual resolved executable, application
+version, schema, editor protocol, and each supported feature, alongside Neovim
+and Git availability.
+
+Native repository notifications use:
+
+```text
+ESC ] 51 ; igit-changed ; {"version":1,"session":"IGIT_NVIM_SESSION token","repo":"/absolute/repository"} BEL
+```
+
+The terminal buffer and session token must match the originating process.
+Authenticated events reconcile that repository's loaded buffers and request
+`IgitChanged`; they indicate invalidation, not a successful Git write.
+Foreign-session, malformed, and relative-path events are ignored. Hidden
+sessions can invalidate buffers without moving focus. Authenticated editor or
+revision requests with an unsupported protocol receive a diagnostic while the
+originating terminal owns focus. Editor requests from inactive sessions do not
+open buffers or display delayed errors over the current editor.
 
 ## Edit a working file from IGit
 
 Highlight a file in Commit Changes and press `e` or `E`. With a matching native
-IGit build, the plugin opens its working copy in the source Neovim window. An
+IGit build, the plugin opens its working copy in an editing window. An
 already loaded buffer keeps unsaved edits. Floating IGit windows hide after the
 file opens; splits stay visible and tab sessions stay open while focus returns
 to the editor. The IGit process, drafts and checked files are retained. Reopen
@@ -392,8 +494,15 @@ the same command or use your normal IGit shortcut to return.
 Save normally in Neovim. IGit's file watcher updates working-copy changes; the
 Git index keeps its existing staged content until an explicit reviewed action.
 Deleted files and submodule directories require an existing file target.
-Neovim's normal modified-buffer guards apply: a blocked switch reports an error
-and leaves the IGit window available. The bridge uses native terminal requests,
+The plugin first reuses a window showing the target in the source tab, then the
+source editing window or another suitable editing window. Protected source
+buffers, including modified buffers with `bufhidden=wipe`, `delete`, or `unload`,
+keep their contents and options. If no window can safely switch buffers, a new
+split opens the file. Buffer-locked windows, previews, terminals, and utility
+buffers are preserved. A buffer-locked ordinary window already showing the
+target can still receive focus. Other opening failures show a concise error and
+leave the IGit window available. An unused fallback split is removed; a fallback
+containing modified target text is retained. The bridge uses native terminal requests,
 requires no RPC server, and does not launch another Neovim process. Both plugin
 and executable must support this feature; standalone IGit uses Git's configured
 external editor.
@@ -455,6 +564,9 @@ igit.close()
 igit.next_hunk()
 igit.prev_hunk()
 igit.preview_hunk()                 -- Cached floating hunk diff.
+igit.preview_hunk("staged")
+igit.next_hunk("unstaged")
+igit.undo_stage()
 igit.stage_hunk()                  -- Cursor hunk.
 igit.stage_hunk({ 10, 20 })        -- Selected buffer lines.
 igit.unstage_file()                -- Current file only.
@@ -511,15 +623,21 @@ nvim --headless -u NONE -l tests/blame.lua
 nvim --headless -u NONE -l tests/browse.lua
 nvim --headless -u NONE -l tests/editor.lua
 nvim --headless -u NONE -l tests/file_diff.lua
+nvim --headless -u NONE -l tests/capabilities.lua
+nvim --headless -u NONE -l tests/lifecycle.lua
 ```
 
 The suite uses temporary files, local Git repositories, and fake terminal processes; it does not invoke real IGit or external services. It exercises real Neovim windows, asynchronous Git reads, command-line input, and session cleanup. The Neovim 0.10 API baseline is documented in the official [window and command APIs](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/api.txt) and [terminal job functions](https://github.com/neovim/neovim/blob/v0.10.4/runtime/doc/builtin.txt). The included suite has been run on Neovim 0.12.4.
+
+Filter terminal cases by a Lua pattern with `IGIT_TEST_FILTER`, for example
+`IGIT_TEST_FILTER='file edit' nvim --headless -u NONE -l tests/run.lua`.
 
 To exercise the real native viewer, point the additional smoke test at a freshly
 built executable:
 
 ```sh
 IGIT_NATIVE_BINARY=/absolute/path/to/igit nvim --headless -u NONE -l tests/native_file_diff.lua
+IGIT_NATIVE_BINARY=/absolute/path/to/igit nvim --headless -u NONE -l tests/native_lifecycle.lua
 ```
 
 It uses a disposable Git repository and checks centered source lines, hunk
@@ -527,9 +645,23 @@ navigation, in-viewer undo, restores, source-buffer undo/redo, empty files, BOM
 and final-newline changes, and preservation of the working files, HEAD, and
 real index.
 
-The pre-existing editor suites also pass on Neovim 0.10.4. The new file-diff
-suite was run on Neovim 0.12.4. On 0.10.4, the existing terminal suite's
+The lifecycle smoke test checks the real capability response, repository
+invalidation, terminal hide/exit, and preservation of loaded clean and dirty
+buffers in a disposable repository. These native smoke tests are separate from
+the dependency-free suite and require an explicitly selected executable.
+
+Earlier editor suites were validated on Neovim 0.10.4. Current workflow and
+safe-handoff validation includes the complete suite on Neovim 0.12.4.
+The [safe-handoff verification record](docs/plans/2026-11-16-safe-editor-handoff.md#verification-record)
+also records 19 `file edit` cases and one `protected revision` case on 0.10.4.
+The complete updated suite has not been rerun on 0.10.4; its broader revision
+subset has an existing TypeScript filetype detection failure. On 0.10.4, the
+existing terminal suite's
 20-column, 8-row floating-window case fails in both the original checkout and
 this implementation.
+
+The [complete companion verification report](docs/verification/2026-11-16-plugin-headless.md)
+records the executed suites, logs, implementation limits, and pending native
+integration checks.
 
 See `:help igit.nvim` for the reference. Package managers usually generate help tags; for a manual installation, run `:helptags ALL` once.

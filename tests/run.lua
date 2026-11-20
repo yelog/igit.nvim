@@ -14,7 +14,9 @@ temp = assert(vim.uv.fs_realpath(temp))
 local fixture = temp .. "/fake igit.sh"
 vim.fn.writefile({
   '#!/bin/sh',
-  'printf "%s\\n" "$PWD" "$@" > "$IGIT_NVIM_RECORD"',
+  'for arg do if [ "$arg" = "--capabilities" ]; then printf \'%s\\n\' \'{"schema_version":1,"version":"0.1.3","editor_protocol":1,"capabilities":["editor","revision","file-diff","repository-events"]}\'; exit 0; fi; done',
+  'printf "%s\\n" "$PWD" "$@" > "$IGIT_NVIM_RECORD.tmp.$$"',
+  'mv "$IGIT_NVIM_RECORD.tmp.$$" "$IGIT_NVIM_RECORD"',
   'printf "IGit test ready\\n"',
   'IFS= read -r reply',
   'if [ "$reply" = "fail" ]; then exit 23; fi',
@@ -69,6 +71,9 @@ local function clean()
 end
 
 local function test(name, callback)
+  if vim.env.IGIT_TEST_FILTER and not name:find(vim.env.IGIT_TEST_FILTER) then
+    return
+  end
   clean()
   igit.setup({ command = fixture })
   local ok, err = xpcall(callback, debug.traceback)
@@ -245,6 +250,9 @@ local ok, err = xpcall(function()
     equal(command.complete("st", "Igit st", 7), { "stash" })
     equal(command.complete("st", "Igit hunk st", 12), { "stage" })
     equal(command.complete("p", "Igit hunk p", 11), { "prev", "preview" })
+    equal(command.complete("", "Igit hunk next ", 15), { "all", "staged", "unstaged" })
+    equal(command.complete("", "Igit hunk preview ", 18), { "staged", "unstaged" })
+    equal(command.complete("undo", "Igit hunk undo", 14), { "undo-stage" })
     equal(command.complete("", "Igit file ", 10), { "stage", "unstage", "reset" })
     equal(command.complete("", "Igit blame ", 11), { "file", "inline" })
     equal(command.complete("li", "Igit browse li", 14), {})
@@ -392,6 +400,7 @@ local ok, err = xpcall(function()
   local bridge = temp .. "/fake edit bridge.sh"
   vim.fn.writefile({
     '#!/bin/sh',
+    'if [ "$1" = "--capabilities" ]; then printf \'%s\\n\' \'{"schema_version":1,"version":"0.1.3","editor_protocol":1,"capabilities":["editor"]}\'; exit 0; fi',
     'printf "%s\\n" "$IGIT_NVIM_SESSION" > "$IGIT_NVIM_RECORD"',
     'while IFS= read -r request; do',
     '  printf "\\033]51;igit-edit;%s\\007" "$request"',
@@ -407,6 +416,7 @@ local ok, err = xpcall(function()
   local revision_bridge = temp .. "/fake revision bridge.sh"
   vim.fn.writefile({
     '#!/bin/sh',
+    'if [ "$1" = "--capabilities" ]; then printf \'%s\\n\' \'{"schema_version":1,"version":"0.1.3","editor_protocol":1,"capabilities":["revision"]}\'; exit 0; fi',
     'printf "%s\\n" "$IGIT_NVIM_SESSION" > "$IGIT_NVIM_RECORD"',
     'while IFS= read -r request; do',
     '  printf "\\033]51;igit-show-revision;%s\\007" "$request"',
@@ -518,23 +528,264 @@ local ok, err = xpcall(function()
     end)
   end
 
-  test("a blocked file switch keeps the float, unsaved source and running job", function()
+  for _, policy in ipairs({ "wipe", "delete", "unload" }) do
+    test("file edit preserves a modified source with bufhidden=" .. policy, function()
+      local scratch = api.nvim_create_buf(true, false)
+      api.nvim_win_set_buf(origin, scratch)
+      vim.bo[scratch].bufhidden = policy
+      api.nvim_buf_set_lines(scratch, 0, -1, false, { "unsaved scratch" })
+      local changedtick = api.nvim_buf_get_changedtick(scratch)
+      local window_count = #api.nvim_list_wins()
+      igit.setup({ command = bridge })
+      local buf = assert(igit.open())
+      local token, win, job = record()[1], api.nvim_get_current_win(), vim.b[buf].terminal_job_id
+      edit_request(buf, token, edit_target)
+      wait_for(function()
+        return api.nvim_buf_get_name(api.nvim_get_current_buf()) == edit_target or #notices > 0
+      end)
+      equal(notices, {}, "A protected scratch buffer must not block file editing")
+      local editor = api.nvim_get_current_win()
+      assert(editor ~= origin and editor ~= win)
+      equal(#api.nvim_list_wins(), window_count + 1)
+      assert(not api.nvim_win_is_valid(win))
+      assert(api.nvim_buf_is_loaded(scratch))
+      equal(api.nvim_win_get_buf(origin), scratch)
+      equal(api.nvim_buf_get_lines(scratch, 0, -1, false), { "unsaved scratch" })
+      equal(api.nvim_buf_get_changedtick(scratch), changedtick)
+      equal(vim.bo[scratch].modified, true)
+      equal(vim.bo[scratch].bufhidden, policy)
+      equal(vim.o.hidden, true)
+      equal(vim.fn.jobwait({ job }, 0), { -1 })
+      equal(#notices, 0)
+      api.nvim_win_close(editor, true)
+      api.nvim_set_current_win(origin)
+      vim.bo[scratch].bufhidden = ""
+      vim.bo[scratch].modified = false
+      api.nvim_win_set_buf(origin, origin_buf)
+      api.nvim_buf_delete(scratch, { force = true })
+    end)
+  end
+
+  test("file edit opens a split when the modified source cannot be hidden", function()
     api.nvim_win_set_buf(origin, origin_buf)
     vim.o.hidden = false
     api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "unsaved source" })
+    local changedtick = api.nvim_buf_get_changedtick(origin_buf)
     igit.setup({ command = bridge })
     local buf = assert(igit.open())
     local token, win = record()[1], api.nvim_get_current_win()
     edit_request(buf, token, edit_target)
-    wait_for(function() return #notices > 0 end)
-    equal(api.nvim_get_current_win(), win)
+    wait_for(function()
+      return api.nvim_buf_get_name(api.nvim_get_current_buf()) == edit_target or #notices > 0
+    end)
+    equal(notices, {})
+    local editor = api.nvim_get_current_win()
+    assert(editor ~= origin and editor ~= win)
+    assert(not api.nvim_win_is_valid(win))
+    equal(api.nvim_win_get_buf(origin), origin_buf)
     equal(api.nvim_buf_get_lines(origin_buf, 0, -1, false), { "unsaved source" })
-    assert(notices[#notices].message:find("Could not edit file", 1, true))
+    equal(api.nvim_buf_get_changedtick(origin_buf), changedtick)
+    equal(vim.bo[origin_buf].modified, true)
+    equal(vim.o.hidden, false)
     equal(vim.fn.jobwait({ vim.b[buf].terminal_job_id }, 0), { -1 })
+    api.nvim_win_close(editor, true)
+    api.nvim_set_current_win(origin)
     vim.o.hidden = true
     api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "test" })
     vim.bo[origin_buf].modified = false
     igit.close()
+  end)
+
+  for _, case in ipairs({ { hidden = true, policy = "" }, { hidden = false, policy = "hide" } }) do
+    test("file edit reuses a source that can safely hide with hidden=" .. tostring(case.hidden), function()
+      api.nvim_win_set_buf(origin, origin_buf)
+      vim.o.hidden = case.hidden
+      vim.bo[origin_buf].bufhidden = case.policy
+      api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "safely hidden source" })
+      local changedtick = api.nvim_buf_get_changedtick(origin_buf)
+      local window_count = #api.nvim_list_wins()
+      igit.setup({ command = bridge })
+      local buf = assert(igit.open())
+      edit_request(buf, record()[1], edit_target)
+      wait_for(function()
+        return api.nvim_buf_get_name(api.nvim_get_current_buf()) == edit_target or #notices > 0
+      end)
+      equal(notices, {})
+      equal(api.nvim_get_current_win(), origin)
+      equal(#api.nvim_list_wins(), window_count)
+      equal(api.nvim_buf_get_lines(origin_buf, 0, -1, false), { "safely hidden source" })
+      equal(api.nvim_buf_get_changedtick(origin_buf), changedtick)
+      equal(vim.bo[origin_buf].modified, true)
+      equal(vim.bo[origin_buf].bufhidden, case.policy)
+      equal(vim.o.hidden, case.hidden)
+      vim.o.hidden = true
+      vim.bo[origin_buf].bufhidden = ""
+      api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "test" })
+      vim.bo[origin_buf].modified = false
+      api.nvim_win_set_buf(origin, origin_buf)
+    end)
+  end
+
+  test("file edit focuses an existing target window even when it is buffer-locked", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    local target = vim.fn.bufadd(edit_target)
+    local editor = api.nvim_open_win(target, false, { split = "right", win = origin })
+    vim.wo[editor].winfixbuf = true
+    local window_count = #api.nvim_list_wins()
+    igit.setup({ command = bridge })
+    local buf = assert(igit.open())
+    edit_request(buf, record()[1], edit_target)
+    wait_for(function() return api.nvim_get_current_win() == editor or #notices > 0 end)
+    equal(notices, {})
+    equal(api.nvim_get_current_win(), editor)
+    equal(api.nvim_win_get_buf(origin), origin_buf)
+    equal(#api.nvim_list_wins(), window_count)
+    equal(vim.wo[editor].winfixbuf, true)
+    api.nvim_win_close(editor, true)
+    api.nvim_set_current_win(origin)
+  end)
+
+  for _, option in ipairs({ "winfixbuf", "previewwindow" }) do
+    test("file edit creates a split instead of replacing a " .. option .. " source", function()
+      api.nvim_win_set_buf(origin, origin_buf)
+      vim.wo[origin][option] = true
+      igit.setup({ command = bridge })
+      local buf = assert(igit.open())
+      local token, win = record()[1], api.nvim_get_current_win()
+      edit_request(buf, token, edit_target)
+      wait_for(function()
+        return api.nvim_buf_get_name(api.nvim_get_current_buf()) == edit_target or #notices > 0
+      end)
+      equal(notices, {})
+      local editor = api.nvim_get_current_win()
+      assert(editor ~= origin and editor ~= win)
+      equal(api.nvim_win_get_buf(origin), origin_buf)
+      equal(vim.wo[origin][option], true)
+      vim.wo[origin][option] = false
+      api.nvim_win_close(editor, true)
+      api.nvim_set_current_win(origin)
+    end)
+  end
+
+  test("file edit skips utility windows and reuses another editing window", function()
+    local utility = api.nvim_create_buf(false, true)
+    api.nvim_buf_set_lines(utility, 0, -1, false, { "service output" })
+    api.nvim_win_set_buf(origin, utility)
+    local editor = api.nvim_open_win(origin_buf, false, { split = "right", win = origin })
+    local window_count = #api.nvim_list_wins()
+    igit.setup({ command = bridge })
+    local buf = assert(igit.open())
+    edit_request(buf, record()[1], edit_target)
+    wait_for(function() return api.nvim_get_current_win() == editor or #notices > 0 end)
+    equal(notices, {})
+    equal(api.nvim_get_current_win(), editor)
+    equal(api.nvim_win_get_buf(origin), utility)
+    equal(api.nvim_buf_get_lines(utility, 0, -1, false), { "service output" })
+    equal(#api.nvim_list_wins(), window_count)
+    api.nvim_win_close(editor, true)
+    api.nvim_set_current_win(origin)
+    api.nvim_win_set_buf(origin, origin_buf)
+    api.nvim_buf_delete(utility, { force = true })
+  end)
+
+  for _, option in ipairs({ "winfixbuf", "previewwindow" }) do
+    test("file edit from a protected source tab preserves the IGit tab and job with " .. option, function()
+      api.nvim_win_set_buf(origin, origin_buf)
+      local source_tab = api.nvim_get_current_tabpage()
+      local window_count = #api.nvim_tabpage_list_wins(source_tab)
+      vim.wo[origin][option] = true
+      igit.setup({ command = bridge, window = { layout = "tab" } })
+      local buf = assert(igit.open())
+      local token, win, job = record()[1], api.nvim_get_current_win(), vim.b[buf].terminal_job_id
+      edit_request(buf, token, edit_target)
+      wait_for(function()
+        return api.nvim_buf_get_name(api.nvim_get_current_buf()) == edit_target or #notices > 0
+      end)
+      equal(notices, {})
+      local editor = api.nvim_get_current_win()
+      assert(editor ~= origin and editor ~= win)
+      equal(api.nvim_get_current_tabpage(), source_tab)
+      equal(#api.nvim_tabpage_list_wins(source_tab), window_count + 1)
+      equal(api.nvim_win_get_buf(origin), origin_buf)
+      equal(api.nvim_win_get_buf(win), buf)
+      equal(vim.fn.jobwait({ job }, 0), { -1 })
+      equal(igit.open(), buf)
+      equal(api.nvim_get_current_win(), win)
+      equal(vim.b[buf].terminal_job_id, job)
+      igit.close()
+      vim.wo[origin][option] = false
+      api.nvim_win_close(editor, true)
+      api.nvim_set_current_win(origin)
+    end)
+  end
+
+  test("file edit failures remove a fallback split and keep a concise diagnostic", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    vim.wo[origin].winfixbuf = true
+    local target = vim.fn.bufadd(edit_target)
+    local autocmd = api.nvim_create_autocmd("BufEnter", {
+      buffer = target,
+      once = true,
+      callback = function() error("E999: Test editor failure") end,
+    })
+    local window_count = #api.nvim_list_wins()
+    igit.setup({ command = bridge })
+    local buf = assert(igit.open())
+    local token, win, job = record()[1], api.nvim_get_current_win(), vim.b[buf].terminal_job_id
+    edit_request(buf, token, edit_target)
+    wait_for(function() return #notices > 0 end)
+    equal(api.nvim_get_current_win(), win)
+    equal(api.nvim_get_current_buf(), buf)
+    equal(api.nvim_win_get_buf(origin), origin_buf)
+    equal(#api.nvim_list_wins(), window_count + 1)
+    equal(vim.fn.jobwait({ job }, 0), { -1 })
+    equal(#notices, 1)
+    equal(notices[1].message, "Could not edit file: E999: Test editor failure")
+    pcall(api.nvim_del_autocmd, autocmd)
+    vim.wo[origin].winfixbuf = false
+    igit.close()
+  end)
+
+  test("file edit failure keeps unsaved target contents with a destructive buffer policy", function()
+    api.nvim_win_set_buf(origin, origin_buf)
+    vim.wo[origin].winfixbuf = true
+    local target = vim.fn.bufadd(edit_target)
+    vim.fn.bufload(target)
+    api.nvim_buf_set_lines(target, 0, -1, false, { "unsaved protected target" })
+    vim.bo[target].bufhidden = "wipe"
+    local changedtick = api.nvim_buf_get_changedtick(target)
+    local autocmd = api.nvim_create_autocmd("BufEnter", {
+      buffer = target,
+      once = true,
+      callback = function() error("E999: Test editor failure") end,
+    })
+    igit.setup({ command = bridge })
+    local buf = assert(igit.open())
+    local token, win, job = record()[1], api.nvim_get_current_win(), vim.b[buf].terminal_job_id
+    edit_request(buf, token, edit_target)
+    wait_for(function() return #notices > 0 end)
+    equal(api.nvim_get_current_win(), win)
+    equal(api.nvim_win_get_buf(origin), origin_buf)
+    assert(api.nvim_buf_is_loaded(target))
+    equal(api.nvim_buf_get_lines(target, 0, -1, false), { "unsaved protected target" })
+    equal(api.nvim_buf_get_changedtick(target), changedtick)
+    equal(vim.bo[target].modified, true)
+    equal(vim.bo[target].bufhidden, "wipe")
+    equal(vim.fn.readfile(edit_target), { "saved target" })
+    equal(vim.fn.jobwait({ job }, 0), { -1 })
+    equal(notices[1].message, "Could not edit file: E999: Test editor failure")
+    pcall(api.nvim_del_autocmd, autocmd)
+    edit_request(buf, token, edit_target)
+    wait_for(function() return api.nvim_get_current_buf() == target end)
+    local editor = api.nvim_get_current_win()
+    assert(editor ~= origin and editor ~= win)
+    assert(not api.nvim_win_is_valid(win))
+    equal(vim.fn.jobwait({ job }, 0), { -1 })
+    vim.bo[target].bufhidden = ""
+    vim.bo[target].modified = false
+    vim.wo[origin].winfixbuf = false
+    api.nvim_win_close(editor, true)
+    api.nvim_set_current_win(origin)
   end)
 
   test("Nvim 0.10 requests recover an editing window after the source split closes", function()
@@ -742,7 +993,7 @@ local ok, err = xpcall(function()
     api.nvim_win_set_buf(origin, origin_buf)
   end)
 
-  test("blocked revision switches and delayed requests preserve editor focus", function()
+  test("protected revision sources and delayed requests preserve editor state", function()
     api.nvim_win_set_buf(origin, origin_buf)
     vim.o.hidden = false
     api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "unsaved source" })
@@ -750,11 +1001,20 @@ local ok, err = xpcall(function()
     local term = assert(igit.open())
     local token, term_win = record()[1], api.nvim_get_current_win()
     revision_request(term, token, history_repo, "src/user.ts", revision_one)
-    wait_for(function() return #notices > 0 end)
-    assert(notices[#notices].message:find("Could not show file revision", 1, true), vim.inspect(notices))
-    equal(api.nvim_get_current_win(), term_win)
+    wait_for(function()
+      return vim.b[api.nvim_get_current_buf()].igit_revision ~= nil or #notices > 0
+    end)
+    equal(notices, {})
+    local editor = api.nvim_get_current_win()
+    assert(editor ~= origin and editor ~= term_win)
+    assert(not api.nvim_win_is_valid(term_win))
+    equal(api.nvim_win_get_buf(origin), origin_buf)
     equal(api.nvim_buf_get_lines(origin_buf, 0, -1, false), { "unsaved source" })
+    equal(vim.bo[origin_buf].modified, true)
+    equal(vim.o.hidden, false)
     equal(vim.fn.jobwait({ vim.b[term].terminal_job_id }, 0), { -1 })
+    api.nvim_win_close(editor, true)
+    api.nvim_set_current_win(origin)
     vim.o.hidden = true
     vim.bo[origin_buf].modified = false
     api.nvim_buf_set_lines(origin_buf, 0, -1, false, { "test" })
@@ -767,11 +1027,12 @@ local ok, err = xpcall(function()
       path = "src/user.ts",
       revision = revision_one,
     }) .. "\a"
+    equal(igit.open(), term)
     api.nvim_exec_autocmds("TermRequest", { group = "Igit", buffer = term, data = sequence })
     igit.close()
     vim.wait(200, function() return false end)
     equal(api.nvim_get_current_buf(), origin_buf)
-    equal(#notices, 1)
+    equal(#notices, 0)
   end)
 
   test("an in-flight revision request cannot open after hide and reopen", function()

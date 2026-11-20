@@ -310,6 +310,146 @@ local ok, err = xpcall(function()
     equal(git.text(buf), "new file\n")
   end)
 
+  test("ignore rules remove existing signs and are rechecked on editor refreshes", function()
+    local repo, buf = setup("local configuration\n", ".env.development", true)
+    local namespace = api.nvim_create_namespace("igit.hunks")
+    equal(#hunks.get_hunks(buf), 1)
+    equal(#api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {}), 1)
+    write(repo .. "/.gitignore", ".env.*\n")
+    api.nvim_exec_autocmds("BufEnter", { buffer = buf })
+    wait_for(function()
+      return #api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {}) == 0
+    end)
+    equal(hunks.get_hunks(buf), {})
+    equal(hunks.get_hunks(buf, true), {})
+    equal(git.text(buf), "local configuration\n")
+    equal(notices, {})
+
+    write(repo .. "/.gitignore", ".env.*\n!.env.development\n")
+    api.nvim_exec_autocmds("FocusGained", {})
+    wait_for(function() return #hunks.get_hunks(buf) == 1 end)
+    equal(hunks.get_hunks(buf)[1].type, "add")
+    equal(#api.nvim_buf_get_extmarks(buf, namespace, 0, -1, {}), 1)
+  end)
+
+  test("Git ignore sources suppress additions for untracked files", function()
+    for _, source in ipairs({ "root", "nested", "directory", "exclude", "global" }) do
+      local repo = setup("tracked\n")
+      local directory = repo .. "/nested 中文"
+      vim.fn.mkdir(directory, "p")
+      local name = ".env development ; $literal[1].txt"
+      local path = "nested 中文/" .. name
+      if source == "root" then
+        write(repo .. "/.gitignore", "nested 中文/.env*\n")
+      elseif source == "nested" then
+        write(directory .. "/.gitignore", ".env*\n")
+      elseif source == "directory" then
+        write(repo .. "/.gitignore", "nested 中文/\n")
+      elseif source == "exclude" then
+        write(repo .. "/.git/info/exclude", ".env*\n")
+      else
+        local excludes = repo .. "/global excludes"
+        write(excludes, ".env*\n")
+        run(repo, { "config", "core.excludesFile", excludes })
+      end
+      write(repo .. "/" .. path, "local configuration\n")
+      vim.cmd.edit(vim.fn.fnameescape(repo .. "/" .. path))
+      local buf = api.nvim_get_current_buf()
+      refresh(buf)
+      equal(hunks.get_hunks(buf), {})
+      equal(hunks.get_hunks(buf, true), {})
+      equal(api.nvim_buf_get_extmarks(buf, api.nvim_create_namespace("igit.hunks"), 0, -1, {}), {})
+      equal(git.text(buf), "local configuration\n")
+      equal(notices, {})
+    end
+  end)
+
+  test("ignored files reject hunk and whole-file actions without changing data", function()
+    local repo, buf, path = setup("local configuration\n", ".env.development", true)
+    write(repo .. "/.gitignore", ".env.*\n")
+    write(repo .. "/other.txt", "other staged\n")
+    run(repo, { "add", "--", "other.txt" })
+    set_text(buf, "unsaved local configuration\n")
+    refresh(buf)
+    local before = run(repo, { "ls-files", "--stage" })
+    for _, method in ipairs({ "stage_hunk", "unstage_hunk", "reset_hunk", "stage_file", "unstage_file", "reset_file" }) do
+      notices = {}
+      assert(hunks[method]())
+      wait_for(function() return #notices > 0 end)
+      assert(notices[1]:find("ignored", 1, true), notices[1])
+      equal(run(repo, { "ls-files", "--stage" }), before)
+      equal(git.text(buf), "unsaved local configuration\n")
+      equal(read(repo .. "/" .. path), "local configuration\n")
+    end
+  end)
+
+  test("tracked and force-added files retain hunks when ignore patterns match", function()
+    local repo, buf, path = setup("original\n", ".env.development")
+    write(repo .. "/.gitignore", ".env.*\n")
+    write(repo .. "/" .. path, "staged\n")
+    run(repo, { "add", "--", path })
+    set_text(buf, "unsaved\n")
+    refresh(buf)
+    equal(#hunks.get_hunks(buf), 1)
+    equal(#hunks.get_hunks(buf, true), 1)
+    perform("stage_hunk", 1)
+    equal(index(repo, path), "unsaved\n")
+
+    repo, buf, path = setup("new configuration\n", ".env.development", true)
+    write(repo .. "/.gitignore", ".env.*\n")
+    run(repo, { "add", "--force", "--", path })
+    set_text(buf, "unsaved configuration\n")
+    refresh(buf)
+    equal(#hunks.get_hunks(buf), 1)
+    equal(#hunks.get_hunks(buf, true), 1)
+    perform("stage_file", 1)
+    equal(index(repo, path), "unsaved configuration\n")
+  end)
+
+  test("staged deletions retain hunks when the remaining file matches ignore rules", function()
+    local repo, buf, path = setup("original\n", ".env.development")
+    write(repo .. "/.gitignore", ".env.*\n")
+    run(repo, { "update-index", "--force-remove", "--", path })
+    refresh(buf)
+    equal(#hunks.get_hunks(buf), 1)
+    equal(#hunks.get_hunks(buf, true), 1)
+    equal(hunks.get_hunks(buf, true)[1].type, "delete")
+    perform("unstage_file", 1)
+    equal(index(repo, path), "original\n")
+    equal(git.text(buf), "original\n")
+  end)
+
+  test("failed ignore checks clear obsolete signs without treating errors as additions", function()
+    local repo, buf, path = setup("new configuration\n", ".env.development", true)
+    equal(#hunks.get_hunks(buf), 1)
+    local real_run = git.run
+    git.run = function(directory, arguments, options, callback)
+      if vim.tbl_contains(arguments, "check-ignore") then
+        vim.schedule(function()
+          callback({ code = 128, stdout = "", stderr = "Ignore check failed\n" })
+        end)
+        return
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    local finished, failure
+    hunks.refresh(buf, function(message)
+      failure, finished = message, true
+    end)
+    local completed = vim.wait(5000, function() return finished end, 10)
+    git.run = real_run
+    assert(completed, "Ignore check did not complete")
+    equal(failure, "Ignore check failed")
+    equal(hunks.get_hunks(buf), {})
+    equal(api.nvim_buf_get_extmarks(buf, api.nvim_create_namespace("igit.hunks"), 0, -1, {}), {})
+    equal(run(repo, { "ls-files", "--stage", "--", path }), "")
+    equal(git.text(buf), "new configuration\n")
+    equal(read(repo .. "/" .. path), "new configuration\n")
+    refresh(buf)
+    equal(#hunks.get_hunks(buf), 1)
+    equal(notices, {})
+  end)
+
   test("navigation wraps through staged and unstaged hunks", function()
     local original = numbered()
     local repo, buf, path = setup(original)
@@ -333,6 +473,547 @@ local ok, err = xpcall(function()
     wait_for(function() return api.nvim_win_get_cursor(0)[1] == 18 end)
     git.run = real_run
     equal(calls, 0)
+  end)
+
+  test("explicit previews distinguish HEAD, index and buffer at the same line", function()
+    local repo, buf, path = setup("HEAD text\n")
+    write(repo .. "/" .. path, "index text\n")
+    run(repo, { "add", "--", path })
+    set_text(buf, "buffer text\n")
+    refresh(buf)
+    local source = api.nvim_get_current_win()
+    local win, preview_buf = hunks.preview_hunk("staged")
+    assert(win and preview_buf)
+    local text = table.concat(api.nvim_buf_get_lines(preview_buf, 0, -1, false), "\n")
+    assert(text:find("-HEAD text", 1, true), text)
+    assert(text:find("+index text", 1, true), text)
+    assert(not text:find("buffer text", 1, true), text)
+    equal(api.nvim_get_current_win(), source)
+    equal(api.nvim_win_get_config(win).title[1][1], " IGit Staged Hunk ")
+    api.nvim_set_current_win(win)
+    api.nvim_feedkeys("s", "xt", false)
+    local current = api.nvim_get_current_buf()
+    text = table.concat(api.nvim_buf_get_lines(current, 0, -1, false), "\n")
+    assert(text:find("-index text", 1, true), text)
+    assert(text:find("+buffer text", 1, true), text)
+    equal(api.nvim_win_get_config(0).title[1][1], " IGit Unstaged Hunk ")
+    api.nvim_win_close(api.nvim_get_current_win(), true)
+    equal(index(repo, path), "index text\n")
+    equal(git.text(buf), "buffer text\n")
+  end)
+
+  test("navigation filters staged and unstaged positions independently", function()
+    local original = numbered()
+    local repo, buf, path = setup(original)
+    local staged = original:gsub("line 5\n", "staged five\n"):gsub("line 12\n", "staged twelve\n")
+    write(repo .. "/" .. path, staged)
+    run(repo, { "add", "--", path })
+    set_text(buf, staged:gsub("line 18\n", "unstaged eighteen\n"))
+    refresh(buf)
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    hunks.navigate(1, "unstaged")
+    equal(api.nvim_win_get_cursor(0)[1], 18)
+    hunks.navigate(1, "staged")
+    equal(api.nvim_win_get_cursor(0)[1], 5)
+    hunks.navigate(-1, "staged")
+    equal(api.nvim_win_get_cursor(0)[1], 12)
+    hunks.navigate(1, "unstaged")
+    equal(api.nvim_win_get_cursor(0)[1], 18)
+  end)
+
+  test("Undo Stage restores previous staging and preserves later sibling staging", function()
+    local repo, buf, path = setup("HEAD text\n")
+    write(repo .. "/" .. path, "already staged\n")
+    run(repo, { "add", "--", path })
+    set_text(buf, "unsaved text\n")
+    refresh(buf)
+    perform("stage_hunk", 1)
+    equal(index(repo, path), "unsaved text\n")
+    write(repo .. "/other.txt", "later sibling staging\n")
+    run(repo, { "add", "--", "other.txt" })
+    perform("undo_stage", 1)
+    equal(index(repo, path), "already staged\n")
+    equal(index(repo, "other.txt"), "later sibling staging\n")
+    equal(git.text(buf), "unsaved text\n")
+    equal(read(repo .. "/" .. path), "already staged\n")
+  end)
+
+  test("Undo Stage covers stage and unstage for cursor hunks, ranges and files", function()
+    for _, operation in ipairs({
+      { "stage_hunk", 12 }, { "stage_hunk", { 12, 12 } }, { "stage_file", 1 },
+      { "unstage_hunk", 2 }, { "unstage_hunk", { 2, 2 } }, { "unstage_file", 1 },
+    }) do
+      local original = numbered()
+      local repo, buf, path = setup(original)
+      local staged = original:gsub("line 2\n", "existing staged\n")
+      write(repo .. "/" .. path, staged)
+      run(repo, { "add", "--", path })
+      local working = staged:gsub("line 12\n", "unsaved twelve\n")
+      set_text(buf, working)
+      refresh(buf)
+      perform(operation[1], operation[2])
+      assert(index(repo, path) ~= staged)
+      perform("undo_stage", 1)
+      equal(index(repo, path), staged)
+      equal(git.text(buf), working)
+      equal(read(repo .. "/" .. path), staged)
+    end
+  end)
+
+  test("successive Undo Stage actions restore index history independently of buffer undo", function()
+    local original = numbered()
+    local repo, buf, path = setup(original)
+    local working = original:gsub("line 5\n", "first staging\n"):gsub("line 18\n", "second staging\n")
+    set_text(buf, working)
+    refresh(buf)
+    perform("stage_hunk", 5)
+    perform("stage_hunk", 18)
+    set_text(buf, working .. "newer unsaved text")
+    vim.bo[buf].fixendofline = false
+    perform("undo_stage", 1)
+    equal(index(repo, path), original:gsub("line 5\n", "first staging\n"))
+    perform("undo_stage", 1)
+    equal(index(repo, path), original)
+    equal(git.text(buf), working .. "newer unsaved text")
+    equal(vim.bo[buf].endofline, false)
+    equal(vim.bo[buf].fixendofline, false)
+  end)
+
+  test("Undo Stage restores absent and empty entries and executable modes exactly", function()
+    for _, text in ipairs({ "", "new content\n" }) do
+      local repo, buf, path = setup(text, nil, true)
+      assert(vim.fn.setfperm(repo .. "/" .. path, "rwxr-xr-x") == 1)
+      perform("stage_file", 1)
+      local entry = run(repo, { "ls-files", "--stage", "-z", "--", path })
+      assert(entry:find("^100755 "), entry)
+      perform("undo_stage", 1)
+      equal(run(repo, { "ls-files", "--stage", "-z", "--", path }), "")
+      perform("stage_file", 1)
+      perform("unstage_file", 1)
+      equal(run(repo, { "ls-files", "--stage", "-z", "--", path }), "")
+      perform("undo_stage", 1)
+      equal(run(repo, { "ls-files", "--stage", "-z", "--", path }), entry)
+      equal(git.text(buf), text)
+      equal(read(repo .. "/" .. path), text)
+    end
+  end)
+
+  test("stale Undo Stage refuses external index changes and retains its record for retry", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "staged by plugin\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    local expected = run(repo, { "ls-files", "--stage", "-z", "--", path })
+    write(repo .. "/" .. path, "externally staged\n")
+    write(repo .. "/other.txt", "later sibling\n")
+    run(repo, { "add", "--", path, "other.txt" })
+    local before = run(repo, { "ls-files", "--stage", "-z" })
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    assert(notices[1]:find("index entry changed", 1, true), notices[1])
+    equal(run(repo, { "ls-files", "--stage", "-z" }), before)
+    equal(git.text(buf), "staged by plugin\n")
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    run(repo, { "update-index", "-z", "--index-info" }, { stdin = expected })
+    notices = {}
+    perform("undo_stage", 1)
+    equal(index(repo, path), "original\n")
+    equal(index(repo, "other.txt"), "later sibling\n")
+  end)
+
+  for _, variant in ipairs({
+    { name = "skip-worktree", flags = { "--skip-worktree" }, marker = "S" },
+    { name = "combined", flags = { "--assume-unchanged", "--skip-worktree" }, marker = "s" },
+  }) do
+    test(variant.name .. " index flags survive stage, unstage and Undo Stage", function()
+      local repo, buf, path = setup("original\n")
+      for _, flag in ipairs(variant.flags) do
+        run(repo, { "update-index", flag, "--", path })
+      end
+      set_text(buf, "staged edit\n")
+      refresh(buf)
+      perform("stage_file", 1)
+      equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), variant.marker)
+      perform("undo_stage", 1)
+      equal(index(repo, path), "original\n")
+      equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), variant.marker)
+      perform("stage_file", 1)
+      perform("unstage_file", 1)
+      equal(index(repo, path), "original\n")
+      equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), variant.marker)
+      perform("undo_stage", 1)
+      equal(index(repo, path), "staged edit\n")
+      equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), variant.marker)
+      equal(git.text(buf), "staged edit\n")
+      equal(read(repo .. "/" .. path), "original\n")
+    end)
+  end
+
+  test("flag restoration is verified before publishing the private index", function()
+    local repo, buf, path = setup("original\n")
+    run(repo, { "update-index", "--skip-worktree", "--", path })
+    local before = read(repo .. "/.git/index")
+    set_text(buf, "staged edit\n")
+    refresh(buf)
+    local real_run, intercepted = git.run, false
+    git.run = function(directory, arguments, options, callback)
+      if arguments[1] == "update-index" and vim.tbl_contains(arguments, "--skip-worktree") then
+        intercepted = true
+        vim.schedule(function() callback({ code = 0, stdout = "", stderr = "" }) end)
+        return
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    assert(hunks.stage_file())
+    wait_for(function() return #notices > 0 end)
+    git.run = real_run
+    assert(intercepted)
+    assert(notices[1]:find("index flags", 1, true), notices[1])
+    equal(read(repo .. "/.git/index"), before)
+    equal(index(repo, path), "original\n")
+    equal(git.text(buf), "staged edit\n")
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    notices = {}
+    perform("stage_file", 1)
+    equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), "S")
+  end)
+
+  test("Undo Stage refuses pruned blobs without changing the index and retains history", function()
+    local repo, buf, path = setup("original\n")
+    local staged = "previous staging without a commit\n"
+    write(repo .. "/" .. path, staged)
+    run(repo, { "add", "--", path })
+    local oid = vim.trim(run(repo, { "rev-parse", ":" .. path }))
+    set_text(buf, "staged by plugin\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    write(repo .. "/other.txt", "later sibling\n")
+    run(repo, { "add", "--", "other.txt" })
+    run(repo, { "gc", "--prune=now" })
+    local missing = vim.system({ "git", "-C", repo, "cat-file", "-e", oid }, { text = false }):wait()
+    assert(missing.code ~= 0, "The previous staged blob was not pruned")
+    local before = read(repo .. "/.git/index")
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    assert(notices[1]:find("previous staged blob", 1, true), notices[1])
+    equal(read(repo .. "/.git/index"), before)
+    equal(index(repo, path), "staged by plugin\n")
+    equal(index(repo, "other.txt"), "later sibling\n")
+    equal(git.text(buf), "staged by plugin\n")
+    equal(read(repo .. "/" .. path), staged)
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    equal(vim.trim(run(repo, { "hash-object", "-w", "--stdin" }, { stdin = staged })), oid)
+    notices = {}
+    perform("undo_stage", 1)
+    equal(index(repo, path), staged)
+    equal(index(repo, "other.txt"), "later sibling\n")
+  end)
+
+  for _, failure in ipairs({ "unexpected type", "unreadable content" }) do
+    test("Undo Stage retains history when the previous blob has " .. failure, function()
+      local repo, buf, path = setup("original\n")
+      set_text(buf, "staged by plugin\n")
+      refresh(buf)
+      perform("stage_file", 1)
+      write(repo .. "/other.txt", "later sibling\n")
+      run(repo, { "add", "--", "other.txt" })
+      local before = read(repo .. "/.git/index")
+      local real_run, intercepted = git.run, false
+      git.run = function(directory, arguments, options, callback)
+        if options.env and options.env.GIT_INDEX_FILE and arguments[1] == "cat-file"
+            and arguments[2] == (failure == "unexpected type" and "-t" or "blob") then
+          intercepted = true
+          vim.schedule(function()
+            callback({
+              code = failure == "unexpected type" and 0 or 128,
+              stdout = failure == "unexpected type" and "tree\n" or "",
+              stderr = failure == "unexpected type" and "" or "Unreadable object content",
+            })
+          end)
+          return
+        end
+        return real_run(directory, arguments, options, callback)
+      end
+      assert(hunks.undo_stage())
+      wait_for(function() return #notices > 0 end)
+      git.run = real_run
+      assert(intercepted)
+      assert(notices[1]:find("previous staged blob", 1, true), notices[1])
+      equal(read(repo .. "/.git/index"), before)
+      equal(index(repo, path), "staged by plugin\n")
+      equal(index(repo, "other.txt"), "later sibling\n")
+      equal(git.text(buf), "staged by plugin\n")
+      equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+      notices = {}
+      perform("undo_stage", 1)
+      equal(index(repo, path), "original\n")
+      equal(index(repo, "other.txt"), "later sibling\n")
+    end)
+  end
+
+  test("stage and unstage reject flag-only changes after capture", function()
+    for _, method in ipairs({ "stage_file", "unstage_file" }) do
+      local repo, buf, path = setup("original\n")
+      write(repo .. "/" .. path, "already staged\n")
+      run(repo, { "add", "--", path })
+      set_text(buf, "reviewed edit\n")
+      refresh(buf)
+      local real_run = git.run
+      git.run = function(directory, arguments, options, callback)
+        if arguments[1] == "rev-parse" and vim.tbl_contains(arguments, "--git-path") then
+          run(repo, { "update-index", "--skip-worktree", "--", path })
+        end
+        return real_run(directory, arguments, options, callback)
+      end
+      assert(hunks[method]())
+      wait_for(function() return #notices > 0 end)
+      git.run = real_run
+      assert(notices[1]:find("index entry changed", 1, true), notices[1])
+      equal(index(repo, path), "already staged\n")
+      equal(index(repo, "other.txt"), "other original\n")
+      equal(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1), "S")
+      equal(git.text(buf), "reviewed edit\n")
+      equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+      notices = {}
+      perform(method, 1)
+    end
+  end)
+
+  test("index flags survive staging and undo and external flag changes are detected", function()
+    local repo, buf, path = setup("original\n")
+    run(repo, { "update-index", "--assume-unchanged", "--", path })
+    set_text(buf, "staged edit\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    assert(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1) == "h")
+    perform("undo_stage", 1)
+    equal(index(repo, path), "original\n")
+    assert(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1) == "h")
+    run(repo, { "update-index", "--no-assume-unchanged", "--", path })
+    perform("stage_file", 1)
+    run(repo, { "update-index", "--skip-worktree", "--", path })
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    assert(notices[1]:find("index entry changed", 1, true), notices[1])
+    equal(index(repo, path), "staged edit\n")
+    assert(run(repo, { "ls-files", "-v", "--", path }):sub(1, 1) == "S")
+  end)
+
+  test("Undo Stage respects an existing index lock without deleting it", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "staged edit\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    write(repo .. "/.git/index.lock", "another operation")
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    assert(notices[1]:find("Could not lock the Git index", 1, true), notices[1])
+    equal(read(repo .. "/.git/index.lock"), "another operation")
+    equal(index(repo, path), "staged edit\n")
+    assert(vim.uv.fs_unlink(repo .. "/.git/index.lock"))
+    notices = {}
+    perform("undo_stage", 1)
+    equal(index(repo, path), "original\n")
+  end)
+
+  for _, failure in ipairs({ "failure", "timeout" }) do
+    for _, operation in ipairs({ "stage_file", "undo_stage" }) do
+      test(operation .. " child " .. failure .. " cleans owned locks and preserves existing locks", function()
+        local repo, buf, path = setup("original\n")
+        set_text(buf, "reviewed edit\n")
+        refresh(buf)
+        if operation == "undo_stage" then
+          perform("stage_file", 1)
+        end
+        local before = read(repo .. "/.git/index")
+        local external = repo .. "/.git/index.lock.lock"
+        write(external, "another operation's nested lock")
+        local real_run, candidate, child_result = git.run, nil, nil
+        git.run = function(directory, arguments, options, callback)
+          if operation == "stage_file" and arguments[1] == "apply"
+              or operation == "undo_stage" and arguments[1] == "update-index"
+              and vim.tbl_contains(arguments, "--index-info") then
+            candidate = options.env.GIT_INDEX_FILE
+            local child = { "sh", "-c", failure == "timeout"
+              and 'printf owned > "$1.lock"; exec sleep 10'
+              or 'printf owned > "$1.lock"; exit 7', "igit-test", candidate }
+            return vim.system(child, { text = false, timeout = failure == "timeout" and 100 or nil }, function(result)
+              child_result = result
+              vim.schedule(function() callback(result) end)
+            end)
+          end
+          return real_run(directory, arguments, options, callback)
+        end
+        assert(hunks[operation]())
+        wait_for(function() return #notices > 0 end)
+        git.run = real_run
+        assert(child_result and child_result.code ~= 0)
+        if failure == "timeout" then
+          equal(child_result.code, 124)
+        end
+        assert(candidate)
+        assert(candidate ~= repo .. "/.git/index.lock", "Child Git shares the real index lock pathname")
+        equal(vim.uv.fs_stat(candidate), nil)
+        equal(vim.uv.fs_stat(candidate .. ".lock"), nil)
+        equal(vim.uv.fs_stat(vim.fs.dirname(candidate)), nil)
+        equal(read(external), "another operation's nested lock")
+        equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+        equal(read(repo .. "/.git/index"), before)
+        equal(index(repo, path), operation == "undo_stage" and "reviewed edit\n" or "original\n")
+        equal(index(repo, "other.txt"), "other original\n")
+        equal(git.text(buf), "reviewed edit\n")
+        notices = {}
+        perform(operation, 1)
+        if operation == "stage_file" then
+          perform("undo_stage", 1)
+        end
+        equal(index(repo, path), "original\n")
+        equal(read(external), "another operation's nested lock")
+      end)
+    end
+  end
+
+  test("Undo Stage publication failures retain history and clean transaction files", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "reviewed edit\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    write(repo .. "/other.txt", "later sibling\n")
+    run(repo, { "add", "--", "other.txt" })
+    local before = read(repo .. "/.git/index")
+    local index_path = assert(vim.uv.fs_realpath(repo .. "/.git/index"))
+    local real_rename, candidate = vim.uv.fs_rename, nil
+    vim.uv.fs_rename = function(source, destination, ...)
+      if vim.uv.fs_realpath(destination) == index_path then
+        candidate = source
+        return nil, "ENOSPC: no space left on device"
+      end
+      return real_rename(source, destination, ...)
+    end
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    vim.uv.fs_rename = real_rename
+    assert(candidate)
+    assert(notices[1]:find("Could not publish the Git index", 1, true), notices[1])
+    equal(read(repo .. "/.git/index"), before)
+    equal(index(repo, path), "reviewed edit\n")
+    equal(index(repo, "other.txt"), "later sibling\n")
+    equal(git.text(buf), "reviewed edit\n")
+    equal(vim.uv.fs_stat(candidate), nil)
+    equal(vim.uv.fs_stat(candidate .. ".lock"), nil)
+    equal(vim.uv.fs_stat(vim.fs.dirname(candidate)), nil)
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    notices = {}
+    perform("undo_stage", 1)
+    equal(index(repo, path), "original\n")
+    equal(index(repo, "other.txt"), "later sibling\n")
+  end)
+
+  test("private index transactions preserve split-index entries", function()
+    local repo, buf, path = setup("original\n")
+    run(repo, { "update-index", "--split-index" })
+    set_text(buf, "reviewed edit\n")
+    refresh(buf)
+    perform("stage_file", 1)
+    equal(index(repo, path), "reviewed edit\n")
+    equal(index(repo, "other.txt"), "other original\n")
+    perform("undo_stage", 1)
+    equal(index(repo, path), "original\n")
+    equal(index(repo, "other.txt"), "other original\n")
+  end)
+
+  test("a stage transaction preserves sibling staging that changed after its snapshot", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "reviewed edit\n")
+    refresh(buf)
+    local real_run = git.run
+    git.run = function(directory, arguments, options, callback)
+      if arguments[1] == "rev-parse" and vim.tbl_contains(arguments, "--git-path") then
+        write(repo .. "/other.txt", "concurrent sibling\n")
+        run(repo, { "add", "--", "other.txt" })
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    perform("stage_file", 1)
+    git.run = real_run
+    equal(index(repo, path), "reviewed edit\n")
+    equal(index(repo, "other.txt"), "concurrent sibling\n")
+  end)
+
+  test("an index transaction holds the real lock until publication", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "reviewed edit\n")
+    refresh(buf)
+    local real_run = git.run
+    local concurrent_result
+    git.run = function(directory, arguments, options, callback)
+      if arguments[1] == "apply" then
+        write(repo .. "/other.txt", "concurrent sibling\n")
+        concurrent_result = vim.system({ "git", "-C", repo, "add", "--", "other.txt" }, { text = false }):wait()
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    perform("stage_file", 1)
+    git.run = real_run
+    assert(concurrent_result and concurrent_result.code ~= 0)
+    assert(concurrent_result.stderr:find("index.lock", 1, true))
+    equal(index(repo, path), "reviewed edit\n")
+    equal(index(repo, "other.txt"), "other original\n")
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+  end)
+
+  test("buffer changes during staging discard the private index and add no undo record", function()
+    local repo, buf, path = setup("original\n")
+    set_text(buf, "reviewed edit\n")
+    refresh(buf)
+    local real_run = git.run
+    git.run = function(directory, arguments, options, callback)
+      if arguments[1] == "apply" then
+        set_text(buf, "newer edit\n")
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    assert(hunks.stage_file())
+    wait_for(function() return #notices > 0 end)
+    git.run = real_run
+    assert(notices[1]:find("buffer changed", 1, true), notices[1])
+    equal(index(repo, path), "original\n")
+    equal(git.text(buf), "newer edit\n")
+    equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    notices = {}
+    assert(hunks.undo_stage())
+    wait_for(function() return #notices > 0 end)
+    assert(notices[1]:find("No staging action to undo", 1, true), notices[1])
+  end)
+
+  test("HEAD and branch changes during staging refuse publication without changing index entries", function()
+    for _, change in ipairs({ "revision", "branch" }) do
+      local repo, buf, path = setup("original\n")
+      local alternate = vim.trim(run(repo, { "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "alternate" }))
+      local initial = vim.trim(run(repo, { "rev-parse", "HEAD" }))
+      run(repo, { "update-ref", "refs/heads/alternate", initial })
+      set_text(buf, "reviewed edit\n")
+      refresh(buf)
+      local real_run = git.run
+      git.run = function(directory, arguments, options, callback)
+        if arguments[1] == "apply" then
+          if change == "revision" then
+            run(repo, { "update-ref", "HEAD", alternate })
+          else
+            run(repo, { "symbolic-ref", "HEAD", "refs/heads/alternate" })
+          end
+        end
+        return real_run(directory, arguments, options, callback)
+      end
+      assert(hunks.stage_file())
+      wait_for(function() return #notices > 0 end)
+      git.run = real_run
+      assert(notices[1]:find("changed while preparing the index action", 1, true), notices[1])
+      equal(index(repo, path), "original\n")
+      equal(index(repo, "other.txt"), "other original\n")
+      equal(git.text(buf), "reviewed edit\n")
+      equal(vim.fn.filereadable(repo .. "/.git/index.lock"), 0)
+    end
   end)
 
   test("hunk preview is cached, scoped, and does not move focus", function()
@@ -371,6 +1052,27 @@ local ok, err = xpcall(function()
     api.nvim_win_close(win, true)
   end)
 
+  test("a queued editor refresh cannot invalidate an explicit preview read", function()
+    local _, buf = setup("original\n")
+    set_text(buf, "unsaved text\n")
+    local injected, real_run = false, git.run
+    git.run = function(directory, arguments, options, callback)
+      if arguments[1] == "ls-files" and not injected then
+        injected = true
+        vim.schedule(function() api.nvim_exec_autocmds("TextChanged", { buffer = buf }) end)
+      end
+      return real_run(directory, arguments, options, callback)
+    end
+    local win, preview_buf = hunks.preview_hunk("unstaged")
+    git.run = real_run
+    assert(win and preview_buf, vim.inspect(notices))
+    assert(injected)
+    local text = table.concat(api.nvim_buf_get_lines(preview_buf, 0, -1, false), "\n")
+    assert(text:find("+unsaved text", 1, true), text)
+    equal(notices, {})
+    api.nvim_win_close(win, true)
+  end)
+
   test("worktrees resolve their own index instead of the main repository index", function()
     local original = numbered()
     local repo, _, path = setup(original)
@@ -382,6 +1084,9 @@ local ok, err = xpcall(function()
     refresh(buf)
     perform("stage_hunk", 9)
     equal(index(worktree, path), original:gsub("line 9\n", "worktree edit\n"))
+    equal(index(repo, path), original)
+    perform("undo_stage", 1)
+    equal(index(worktree, path), original)
     equal(index(repo, path), original)
   end)
 
@@ -406,7 +1111,7 @@ local ok, err = xpcall(function()
     local real_run = git.run
     local external = original:gsub("line 20\n", "external staging\n")
     git.run = function(directory, arguments, options, callback)
-      if arguments[1] == "apply" then
+      if arguments[1] == "rev-parse" and vim.tbl_contains(arguments, "--git-path") then
         write(repo .. "/" .. path, external)
         run(repo, { "add", "--", path })
       end

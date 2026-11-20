@@ -5,8 +5,8 @@ blame.defaults = {
   inline = {
     enabled = false,
     position = "eol",
-    format = "{author}, {date}: {summary}",
-    date_format = "%Y-%m-%d",
+    format = "{author}, {date} · {summary}",
+    date_format = "%Y/%m/%d, %H:%M",
     delay = 250,
   },
   file = {

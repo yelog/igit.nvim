@@ -102,9 +102,9 @@ local status_contents
 local head_revision
 local saved_statusline = vim.o.statusline
 local file = temp .. "/history 中文.txt"
-local old_commit_epoch = os.time({ year = 2001, month = 1, day = 2, hour = 12 })
+local old_commit_epoch = os.time({ year = 2001, month = 1, day = 2, hour = 12, min = 34, sec = 56 })
 local recent_commit_epoch = os.time({ year = 2099, month = 12, day = 31, hour = 12 })
-local old_inline_date = os.date("%Y-%m-%d", old_commit_epoch)
+local old_inline_date = os.date("%Y/%m/%d, %H:%M", old_commit_epoch)
 local old_file_date = os.date("%Y/%m/%d", old_commit_epoch)
 local recent_file_date = os.date("%Y/%m/%d", recent_commit_epoch)
 local function git_date(epoch)
@@ -279,8 +279,8 @@ local success, failure = xpcall(function()
     equal(blame.defaults.inline, {
       enabled = false,
       position = "eol",
-      format = "{author}, {date}: {summary}",
-      date_format = "%Y-%m-%d",
+      format = "{author}, {date} · {summary}",
+      date_format = "%Y/%m/%d, %H:%M",
       delay = 250,
     })
     equal(blame.defaults.file, {
@@ -498,6 +498,10 @@ local success, failure = xpcall(function()
   case("inline EOL shows only the cursor line and reuses cached blame", function()
     focus_source()
     api.nvim_win_set_cursor(source_window, { 1, 0 })
+    blame.setup({ inline = { enabled = true, delay = 1 } })
+    wait_for(function()
+      return virtual_text(0) == "Alice 中文, " .. old_inline_date .. " · initial 中文 10%"
+    end, "default inline blame did not show minutes and the middle-dot separator")
     blame.setup({
       inline = {
         enabled = true,

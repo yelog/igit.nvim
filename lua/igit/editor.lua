@@ -2,29 +2,66 @@ local M = {}
 local api = vim.api
 local edit_prefix = "\027]51;igit-edit;"
 local revision_prefix = "\027]51;igit-show-revision;"
+local changed_prefix = "\027]51;igit-changed;"
 local max_revision_size = 512 * 1024
 local git_timeout = 15000
 
-local function editor_window(session)
-  local function usable(win)
+local function editor_window(session, target)
+  local function ordinary(win)
     return win and api.nvim_win_is_valid(win)
       and api.nvim_win_get_config(win).relative == ""
-      and vim.bo[api.nvim_win_get_buf(win)].buftype ~= "terminal"
   end
-  if usable(session.source_win) then
-    return session.source_win, false
+  local function usable(win)
+    if not ordinary(win) or vim.wo[win].previewwindow or vim.wo[win].winfixbuf then
+      return false
+    end
+    local buf = api.nvim_win_get_buf(win)
+    local options = vim.bo[buf]
+    if options.buftype ~= "" and not vim.b[buf].igit_revision then
+      return false
+    end
+    return not options.modified or options.bufhidden == "hide"
+      or (options.bufhidden == "" and vim.o.hidden)
   end
-  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+  local source = session.source_win
+  local tab = source and api.nvim_win_is_valid(source) and api.nvim_win_get_tabpage(source) or 0
+  local windows = api.nvim_tabpage_list_wins(tab)
+  for _, win in ipairs(windows) do
+    if ordinary(win) and not vim.wo[win].previewwindow and api.nvim_win_get_buf(win) == target then
+      return win, false
+    end
+  end
+  if usable(source) then
+    return source, false
+  end
+  for _, win in ipairs(windows) do
     if usable(win) then
       return win, false
     end
   end
-  vim.cmd("belowright new")
-  return api.nvim_get_current_win(), true
+  local anchor = ordinary(source) and source or nil
+  if not anchor then
+    for _, win in ipairs(windows) do
+      if ordinary(win) then
+        anchor = win
+        break
+      end
+    end
+  end
+  local win = api.nvim_win_call(anchor or 0, function()
+    vim.cmd("belowright new")
+    return api.nvim_get_current_win()
+  end)
+  return win, true
+end
+
+local function error_message(err)
+  local message = tostring(err)
+  return message:match("E%d+:[^\n]+") or message:match("[^\n]+") or message
 end
 
 local function owns_focus(session)
-  return session and not session.deleted and session.win
+  return session and not session.deleted and not session.exited and session.win
     and api.nvim_win_is_valid(session.win)
     and api.nvim_win_get_buf(session.win) == session.buf
     and api.nvim_get_current_win() == session.win
@@ -45,14 +82,19 @@ local function open_buffer(session, buf, hide)
     return
   end
   vim.cmd.stopinsert()
-  local win, created = editor_window(session)
+  local win, created = editor_window(session, buf)
   local ok, result = pcall(api.nvim_win_call, win, function()
     vim.cmd("buffer " .. buf)
     return buf
   end)
   if not ok then
-    if created and api.nvim_win_is_valid(win) then
+    if created and api.nvim_win_is_valid(win)
+        and not vim.bo[api.nvim_win_get_buf(win)].modified then
       pcall(api.nvim_win_close, win, true)
+    end
+    if not owns_focus(session) and session.win and api.nvim_win_is_valid(session.win)
+        and api.nvim_win_get_buf(session.win) == session.buf then
+      pcall(api.nvim_set_current_win, session.win)
     end
     error(result, 0)
   end
@@ -317,7 +359,7 @@ local function read_revision(session, request_id, request_win, hide, repo, path,
           open_buffer(session, buf, hide)
         end)
         if not opened then
-          fail(tostring(err))
+          fail(error_message(err))
         end
       end)
     end)
@@ -351,7 +393,7 @@ local function show_revision(session, request, hide, request_id, request_win)
   if existing then
     local ok, err = pcall(open_buffer, session, existing, hide)
     if not ok then
-      recover(session, "Could not show file revision: " .. tostring(err))
+      recover(session, "Could not show file revision: " .. error_message(err))
     end
     return
   end
@@ -373,7 +415,28 @@ local function event_sequence(event)
   if type(sequence) ~= "string" then
     return
   end
-  return (sequence:gsub("\a+$", ""))
+  return (sequence:gsub("\027\\$", ""):gsub("\a+$", ""))
+end
+
+local function supported(session, request, feature)
+  if request.session ~= session.token or session.deleted or session.exited then
+    return false
+  end
+  local message
+  if request.version ~= 1 then
+    message = "Unsupported IGit editor request version " .. tostring(request.version)
+      .. "; expected 1. Update IGit or igit.nvim."
+  else
+    local accepted, capability_error = require("igit.capabilities").check(session.capabilities, feature)
+    if accepted then
+      return true
+    end
+    message = capability_error
+  end
+  vim.schedule(function()
+    recover(session, message)
+  end)
+  return false
 end
 
 function M.request(event, session, hide)
@@ -384,9 +447,16 @@ function M.request(event, session, hide)
   if not sequence then
     return
   end
+  local invalidation = decoded_request(sequence, changed_prefix)
+  if invalidation then
+    if supported(session, invalidation, "repository-events") and valid_absolute_path(invalidation.repo) then
+      require("igit.sync").invalidate(session, invalidation.repo)
+    end
+    return
+  end
   local edit_request = decoded_request(sequence, edit_prefix)
   if edit_request then
-    if edit_request.version ~= 1 or edit_request.session ~= session.token
+    if not supported(session, edit_request, "editor")
         or type(edit_request.path) ~= "string"
         or edit_request.path:find("\0", 1, true)
         or not valid_absolute_path(edit_request.path) then
@@ -395,13 +465,14 @@ function M.request(event, session, hide)
     vim.schedule(function()
       local edited, err = pcall(edit, session, edit_request.path, hide)
       if not edited then
-        recover(session, "Could not edit file: " .. tostring(err))
+        recover(session, "Could not edit file: " .. error_message(err))
       end
     end)
     return
   end
   local revision_request = decoded_request(sequence, revision_prefix)
-  if not valid_revision_request(revision_request, session) then
+  if not revision_request or not supported(session, revision_request, "revision")
+      or not valid_revision_request(revision_request, session) then
     return
   end
   if not owns_focus(session) then

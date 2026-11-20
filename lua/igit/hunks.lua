@@ -1,9 +1,12 @@
 local M = {}
 local api = vim.api
 local git = require("igit.git")
+local index = require("igit.index")
 local git_status = require("igit.status")
 local namespace = api.nvim_create_namespace("igit.hunks")
 local states, watchers, writes = {}, {}, {}
+local undo_history = {}
+local undo_limit = 100
 local preview
 
 M.defaults = {
@@ -178,6 +181,27 @@ local function render(buf, snapshot)
 end
 
 local function read(context, snapshot, callback)
+  local function finish_read()
+    if snapshot.oid or snapshot.head_oid then
+      return callback(nil, snapshot)
+    end
+    git.run(context.repo, { "--no-literal-pathspecs", "check-ignore", "--quiet", "--", context.path }, {}, function(result)
+      if result.code ~= 0 and result.code ~= 1 then
+        return callback(git.error(result))
+      end
+      snapshot.ignored = result.code == 0
+      callback(nil, snapshot)
+    end)
+  end
+  local function complete()
+    git.run(context.repo, { "symbolic-ref", "--quiet", "HEAD" }, {}, function(result)
+      if result.code ~= 0 and result.code ~= 1 then
+        return callback(git.error(result))
+      end
+      snapshot.ref = result.code == 0 and vim.trim(result.stdout) or false
+      finish_read()
+    end)
+  end
   local function blob(oid, done)
     if not oid then
       return done("")
@@ -189,14 +213,12 @@ local function read(context, snapshot, callback)
       done(result.stdout)
     end)
   end
-  git.run(context.repo, { "ls-files", "--stage", "-z", "--", context.path }, {}, function(result)
-    if result.code ~= 0 then
-      return callback(git.error(result))
+  index.read_entry(context, {}, function(entry_error, entry)
+    if entry_error then
+      return callback(entry_error)
     end
-    local entries = vim.split(result.stdout, "\0", { plain = true, trimempty = true })
-    if #entries > 1 then
-      return callback("Resolve the file's index conflicts before using hunks")
-    end
+    snapshot.entry = entry
+    local entries = vim.split(entry.entry, "\0", { plain = true, trimempty = true })
     if entries[1] then
       local mode, oid, stage, path = entries[1]:match("^(%d+) (%x+) (%d)\t(.*)$")
       if stage ~= "0" or path ~= context.path then
@@ -224,7 +246,7 @@ local function read(context, snapshot, callback)
                 return callback(git.error(head_result))
               end
               snapshot.head = assert(content(""))
-              callback(nil, snapshot)
+              complete()
             end)
           end)
         end
@@ -246,7 +268,7 @@ local function read(context, snapshot, callback)
               return callback(head_error)
             end
             snapshot.head = head
-            callback(nil, snapshot)
+            complete()
           end)
         end)
       end)
@@ -300,8 +322,8 @@ function M.refresh(buf, callback)
     else
       snapshot = result
       snapshot.context = state.context
-      snapshot.hunks = differences(snapshot.index, snapshot.buffer)
-      snapshot.staged = differences(snapshot.head, snapshot.index)
+      snapshot.hunks = snapshot.ignored and {} or differences(snapshot.index, snapshot.buffer)
+      snapshot.staged = snapshot.ignored and {} or differences(snapshot.head, snapshot.index)
       for _, hunk in ipairs(snapshot.staged) do
         hunk.start = buffer_position(math.max(1, hunk.new_start), snapshot.hunks)
         hunk.finish = buffer_position(math.max(1, hunk.new_start + hunk.new_count - 1), snapshot.hunks)
@@ -745,6 +767,9 @@ local function action(kind, requested_range, whole_file)
     if err then
       return done(err)
     end
+    if snapshot.ignored then
+      return done("Hunk actions are unavailable for ignored files")
+    end
     if range and not whole_file then
       local normalized, range_error = normalize_range(range, #snapshot.buffer.lines)
       if not normalized then
@@ -878,11 +903,26 @@ local function action(kind, requested_range, whole_file)
           .. " no " .. (kind == "unstage" and "staged" or "unstaged") .. " changes")
       end
       local remove = kind == "unstage" and not snapshot.head_oid and target == ""
-      git.run(context.repo, { "apply", "--cached", "--whitespace=nowarn", "-" }, {
-        stdin = patch(snapshot, target, remove),
-      }, function(result)
-        finish(result.code ~= 0 and ("Could not " .. kind .. " " .. (whole_file and "file" or "hunk")
-          .. ": " .. git.error(result)) or nil)
+      index.update(context, snapshot.entry, {
+        patch = patch(snapshot, target, remove),
+        head = { revision = snapshot.revision, ref = snapshot.ref },
+        validate = function()
+          if states[buf] ~= state or not valid(buf) or api.nvim_buf_get_changedtick(buf) ~= snapshot.tick
+              or api.nvim_buf_get_name(buf) ~= snapshot.name then
+            return "The buffer changed; retry the hunk action"
+          end
+        end,
+      }, function(message, before, after)
+        if not message and not vim.deep_equal(before, after) then
+          undo_history[#undo_history + 1] = {
+            repo = context.repo, path = context.path, before = before, after = after,
+          }
+          if #undo_history > undo_limit then
+            table.remove(undo_history, 1)
+          end
+        end
+        finish(message and ("Could not " .. kind .. " " .. (whole_file and "file" or "hunk")
+          .. ": " .. message) or nil)
       end)
     end)
   end)
@@ -913,6 +953,70 @@ function M.reset_file()
   return action("reset", nil, true)
 end
 
+function M.undo_stage()
+  local buf = api.nvim_get_current_buf()
+  if not valid(buf) then
+    return git.notify("The current buffer is not a working file")
+  end
+  local state = states[buf] or { request = 0 }
+  states[buf] = state
+  if state.busy then
+    return git.notify("A hunk action is already running")
+  end
+  state.busy = true
+  local name = api.nvim_buf_get_name(buf)
+  local function done(message)
+    state.busy = false
+    if message then
+      git.notify(message)
+    end
+    if states[buf] == state then
+      queue(buf)
+    end
+  end
+  git.context(buf, function(context_error, context)
+    if context_error then
+      return done(context_error)
+    end
+    if writes[context.repo] then
+      return done("Another index action is running in this repository")
+    end
+    local record
+    for position = #undo_history, 1, -1 do
+      local candidate = undo_history[position]
+      if candidate.repo == context.repo and candidate.path == context.path then
+        record = candidate
+        break
+      end
+    end
+    if not record then
+      return done("No staging action to undo for this file")
+    end
+    writes[context.repo] = true
+    index.update(context, record.after, {
+      entry = record.before,
+      validate = function()
+        if states[buf] ~= state or not valid(buf) or api.nvim_buf_get_name(buf) ~= name then
+          return "The buffer changed; retry Undo Stage"
+        end
+      end,
+    }, function(message)
+      writes[context.repo] = nil
+      if not message then
+        for position = #undo_history, 1, -1 do
+          if undo_history[position] == record then
+            table.remove(undo_history, position)
+            break
+          end
+        end
+      end
+      done(message and ("Could not undo staging: " .. message) or nil)
+      changed(context.repo, buf)
+    end)
+  end)
+  return true
+end
+
 function M.get_hunks(buf, staged)
   buf = buf and buf ~= 0 and buf or api.nvim_get_current_buf()
   local snapshot = states[buf] and states[buf].snapshot
@@ -926,11 +1030,19 @@ local function ensure_snapshot(buf, state)
     return snapshot
   end
   local finished, failure = false, nil
+  local was_busy = state.busy
+  state.busy = true
   M.refresh(buf, function(err)
     failure, finished = err, true
   end)
   if not finished then
     vim.wait(2000, function() return finished end, 10)
+  end
+  state.busy = was_busy
+  local result = state.snapshot
+  if state.pending and not was_busy then
+    state.pending = nil
+    vim.schedule(function() queue(buf) end)
   end
   if not finished then
     return nil, "Timed out while preparing the Git hunk"
@@ -938,7 +1050,7 @@ local function ensure_snapshot(buf, state)
   if failure then
     return nil, failure
   end
-  return state.snapshot
+  return result
 end
 
 function M.select_hunk()
@@ -1019,8 +1131,26 @@ local function preview_text(snapshot, hunk, staged)
   return lines
 end
 
-function M.preview_hunk()
-  local buf = api.nvim_get_current_buf()
+local function comparison(target, allow_all)
+  if target ~= nil and target ~= "staged" and target ~= "unstaged" and not (allow_all and target == "all") then
+    return nil, "Hunk comparison must be staged or unstaged" .. (allow_all and " or all" or "")
+  end
+  return true
+end
+
+function M.preview_hunk(target)
+  local accepted, target_error = comparison(target)
+  if not accepted then
+    return git.notify(target_error)
+  end
+  local buf, source_win = api.nvim_get_current_buf(), api.nvim_get_current_win()
+  local focused = preview and buf == preview.buf
+  local line
+  if focused then
+    buf, source_win, line = preview.source_buf, preview.source_win, preview.line
+  else
+    line = api.nvim_win_get_cursor(source_win)[1]
+  end
   if not valid(buf) then
     return git.notify("The current buffer is not a working file")
   end
@@ -1033,12 +1163,13 @@ function M.preview_hunk()
   if not snapshot then
     return git.notify(snapshot_error)
   end
-  local line = api.nvim_win_get_cursor(0)[1]
-  local hunk = selected(snapshot.hunks, line) or selected(snapshot.staged, line)
+  local hunk = target == "staged" and selected(snapshot.staged, line)
+    or target == "unstaged" and selected(snapshot.hunks, line)
+    or target == nil and (selected(snapshot.hunks, line) or selected(snapshot.staged, line))
   if not hunk then
-    return git.notify("No Git hunk at the cursor")
+    return git.notify("No " .. (target and target .. " " or "Git ") .. "hunk at the cursor")
   end
-  local staged = selected(snapshot.hunks, line) == nil
+  local staged = target == "staged" or target == nil and selected(snapshot.hunks, line) == nil
   local lines = preview_text(snapshot, hunk, staged)
   close_preview()
   local preview_buf = api.nvim_create_buf(false, true)
@@ -1050,7 +1181,7 @@ function M.preview_hunk()
   vim.bo[preview_buf].readonly = true
   local width = math.max(1, math.min(vim.o.columns - 4, 100))
   local height = math.max(1, math.min(#lines, vim.o.lines - 6))
-  local ok, win = pcall(api.nvim_open_win, preview_buf, false, {
+  local ok, win = pcall(api.nvim_open_win, preview_buf, focused or false, {
     relative = "cursor",
     row = 1,
     col = 1,
@@ -1058,21 +1189,31 @@ function M.preview_hunk()
     height = height,
     style = "minimal",
     border = "rounded",
-    title = staged and " IGit Staged Hunk " or " IGit Hunk ",
+    title = staged and " IGit Staged Hunk " or " IGit Unstaged Hunk ",
     title_pos = "center",
   })
   if not ok then
     pcall(api.nvim_buf_delete, preview_buf, { force = true })
     return git.notify("Could not open the hunk preview: " .. tostring(win))
   end
-  preview = { win = win, buf = preview_buf }
+  preview = {
+    win = win, buf = preview_buf, source_buf = buf, source_win = source_win,
+    line = line, target = staged and "staged" or "unstaged",
+  }
   for _, key in ipairs({ "q", "<Esc>" }) do
     vim.keymap.set("n", key, close_preview, { buffer = preview_buf, desc = "Close hunk preview", nowait = true })
   end
+  vim.keymap.set("n", "s", function()
+    M.preview_hunk(staged and "unstaged" or "staged")
+  end, { buffer = preview_buf, desc = "Switch staged/unstaged preview", nowait = true })
   return win, preview_buf
 end
 
-function M.navigate(direction)
+function M.navigate(direction, target)
+  local accepted, target_error = comparison(target, true)
+  if not accepted then
+    return git.notify(target_error)
+  end
   local buf, win = api.nvim_get_current_buf(), api.nvim_get_current_win()
   local count = vim.v.count1
   local function move(snapshot)
@@ -1080,7 +1221,9 @@ function M.navigate(direction)
       return
     end
     local positions, seen = {}, {}
-    for _, hunks in ipairs({ snapshot.hunks, snapshot.staged }) do
+    local groups = target == "staged" and { snapshot.staged }
+      or target == "unstaged" and { snapshot.hunks } or { snapshot.hunks, snapshot.staged }
+    for _, hunks in ipairs(groups) do
       for _, hunk in ipairs(hunks) do
         local position = math.min(api.nvim_buf_line_count(buf), hunk.start)
         if not seen[position] then

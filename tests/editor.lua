@@ -219,6 +219,60 @@ local ok, err = xpcall(function()
     end)
   end)
 
+  test("public commands select comparisons, filter navigation and undo index actions", function()
+    igit.setup({ command = temp .. "/missing-igit", hunks = { debounce = 10 } })
+    local function edit_action(command)
+      local finished = false
+      local autocmd = api.nvim_create_autocmd("User", {
+        pattern = "IgitChanged",
+        callback = function(event)
+          if event.data and event.data.buf == source then
+            finished = true
+          end
+        end,
+      })
+      vim.cmd(command)
+      wait_for(function() return finished end)
+      api.nvim_del_autocmd(autocmd)
+    end
+    local function preview_text()
+      for _, win in ipairs(api.nvim_list_wins()) do
+        local buf = api.nvim_win_get_buf(win)
+        if vim.bo[buf].filetype == "diff" then
+          local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+          api.nvim_win_close(win, true)
+          return text
+        end
+      end
+      error("Hunk preview is missing; " .. vim.inspect(notices))
+    end
+    api.nvim_win_set_cursor(0, { 2, 0 })
+    api.nvim_buf_set_lines(source, 1, 2, false, { "staged two" })
+    edit_action("IgitStageHunk")
+    api.nvim_buf_set_lines(source, 1, 2, false, { "buffer two" })
+    vim.cmd("Igit hunk preview staged")
+    local text = preview_text()
+    assert(text:find("-two", 1, true), text)
+    assert(text:find("+staged two", 1, true), text)
+    vim.cmd("IgitPreviewHunk unstaged")
+    text = preview_text()
+    assert(text:find("-staged two", 1, true), text)
+    assert(text:find("+buffer two", 1, true), text)
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    vim.cmd("IgitNextHunk staged")
+    equal(api.nvim_win_get_cursor(0)[1], 2)
+    vim.cmd("Igit hunk prev unstaged")
+    equal(api.nvim_win_get_cursor(0)[1], 2)
+    edit_action("IgitStageHunk")
+    equal(run({ "show", ":editor file.txt" }), "one\nbuffer two\nthree\n")
+    edit_action("IgitUndoStage")
+    equal(run({ "show", ":editor file.txt" }), "one\nstaged two\nthree\n")
+    edit_action("Igit hunk undo-stage")
+    equal(run({ "show", ":editor file.txt" }), "one\ntwo\nthree\n")
+    edit_action("IgitResetFile")
+    equal(api.nvim_buf_get_lines(source, 0, -1, false), { "one", "two", "three" })
+  end)
+
   test("browse commands preserve Ex ranges and never launch the native terminal", function()
     local opened = {}
     igit.setup({

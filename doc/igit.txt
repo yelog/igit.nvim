@@ -16,15 +16,16 @@ CONTENTS                                                       *igit.nvim*
     Edit working files ................................... |igit-edit-file|
     Show file revisions .................................. |igit-revision-file|
     Revision request protocol ...................... |igit-revision-protocol|
+    Capabilities and health .............................. |igit-health|
 
 ==============================================================================
 REQUIREMENTS                                                *igit-requirements*
 
 Neovim 0.10 or newer and Git. Editor hunk, blame, and browser features do not
 require an IGit executable or Lua dependencies. Terminal panels additionally
-require IGit supporting panel commands, native file history, and revision
-viewing. The current-file diff requires native diff command support. IGit is
-installed separately.
+require IGit. Native editor, revision, and current-file diff integrations
+require their advertised capabilities. Older binaries can still launch ordinary
+panels. IGit is installed separately. See |igit-health|.
 
 ==============================================================================
 COMMANDS                                                        *igit-commands*
@@ -49,7 +50,7 @@ COMMANDS                                                        *igit-commands*
     Hide the current IGit window and return focus. Its process keeps running,
     except for a current-file diff, which is finalized first.
 
-:Igit hunk [next|prev|preview|stage|unstage|reset]
+:Igit hunk [next|prev|preview|stage|unstage|reset|undo-stage]
     Run a hunk action in the current working file. See |igit-hunks|.
 
 :Igit file [stage|unstage|reset]
@@ -114,16 +115,16 @@ layout option.
 
 For local development, use the built binary: >lua
     require("igit").setup({
-      command = vim.fn.expand("~/workspace/tui/igit/target/debug/igit"),
+      command = vim.fn.expand("~/workspace/tui/igit/target-serial/debug/igit"),
     })
 <
 Extra executable arguments use a list, for example: >lua
     require("igit").setup({
-      command = { "cargo", "run", "--quiet", "--locked",
-        "--manifest-path", "/path/to/igit/Cargo.toml",
-        "--bin", "igit", "--" },
+      command = { "igit", "--icons", "unicode" },
     })
 <
+Use an already-built executable. Capability queries have a one-second timeout.
+
 ==============================================================================
 HUNK SIGNS AND ACTIONS                                         *igit-hunks*
 
@@ -150,15 +151,26 @@ Icons must occupy one or two display cells; colors use #RRGGBB. Highlight
 groups are IgitHunkAdd, IgitHunkChange, IgitHunkDelete, and their Staged variants
 (for example IgitHunkStagedAdd). Unstaged signs take priority on overlap.
 
-:IgitNextHunk                                               *:IgitNextHunk*
-:IgitPrevHunk                                               *:IgitPrevHunk*
-    Jump through staged and unstaged hunks, wrapping at either end. Counts
-    apply when invoked through a Lua mapping.
+Git-ignored, untracked files have no signs or change counts. Git evaluates
+nested .gitignore files, .git/info/exclude, core.excludesFile, and negated
+patterns. Files in the index or HEAD keep their hunks even when their paths
+match ignore patterns. Editor entry/focus refreshes recheck ignore rules.
 
-:IgitPreviewHunk                                         *:IgitPreviewHunk*
+:IgitNextHunk [all|staged|unstaged]                          *:IgitNextHunk*
+:IgitPrevHunk [all|staged|unstaged]                          *:IgitPrevHunk*
+    Jump through staged and unstaged hunks, wrapping at either end. Counts
+    apply when invoked through a Lua mapping. An optional target filters the
+    comparison; all is the default. :Igit hunk next/prev accepts the same target.
+
+:IgitPreviewHunk [staged|unstaged]                        *:IgitPreviewHunk*
     Open a read-only floating diff for the unstaged or staged hunk under the
-    cursor. The preview reuses the cached snapshot and does not run Git.
-    Press q or Esc to close it without changing the source window.
+    cursor. A target explicitly selects HEAD-to-index (staged) or index-to-buffer
+    (unstaged), including overlapping changes. Without a target, unstaged takes
+    priority. :Igit hunk preview accepts the same target. The preview reuses a
+    current snapshot and refreshes a stale one. It opens without moving focus;
+    enter it and press s to switch comparisons, or q / Esc to close.
+    If that comparison has no hunk at the source line, the current preview stays
+    open and the plugin reports that no hunk is available.
 
 :IgitStageHunk                                             *:IgitStageHunk*
     Stage the current unstaged hunk, including unsaved buffer content. With an
@@ -168,6 +180,26 @@ groups are IgitHunkAdd, IgitHunkChange, IgitHunkDelete, and their Staged variant
     Restore the current staged hunk to HEAD. Staged line positions are mapped
     through the buffer's unstaged edits. A range is rejected if unstaged
     deletions make its index mapping ambiguous.
+
+:IgitUndoStage                                             *:IgitUndoStage*
+:Igit hunk undo-stage
+    Undo the last plugin stage or unstage action for the current path, including
+    a cursor hunk, range, or complete file. Restores the prior blob, mode,
+    registration, and assume-unchanged/skip-worktree flags. For HEAD=A, index=B,
+    buffer=C, stage then Undo Stage restores index B and retains buffer C.
+
+    The real Git index lock protects validation and publication. The recorded
+    post-action entry must still match; external changes to that entry refuse
+    the undo without modifying any entry. Unrelated staging is preserved.
+    History retains up to 100 successful actions in this Neovim process, across
+    buffer closure and setup() calls. Repeated undos walk back the current
+    path's history. History does not survive Neovim restart. Unstage still means
+    restore to HEAD; buffer u operates independently.
+
+    Stage and unstage also reject changes to the captured entry's flags. Undo
+    checks the previous blob's type and readability before restoring it. If Git
+    garbage collection has pruned that blob, undo refuses without changing the
+    index and retains its history record.
 
 :IgitResetHunk                                             *:IgitResetHunk*
     Restore the current unstaged hunk from the index into the buffer. A range
@@ -211,10 +243,13 @@ hunk action, preview, or a whole-file action. >lua
 <
 
 Stage and unstage modify only the index, leaving other hunks and files intact.
+Writes recheck the captured buffer, index entry, HEAD, and branch before
+publication; stale inputs leave the real index unchanged.
 Reset modifies only the buffer. Binary files, conflicted index entries,
 symlinks, submodules, and files above max_file_size do not support actions.
+Ignored untracked files support neither hunk nor whole-file actions.
 Actions require UTF-8 and reject filter, working-tree-encoding, and ident
-attributes.
+attributes. Index writes also reject intent-to-add entries.
 Metadata-only changes, including executable bits, belong in Commit.
 
 Git directory notifications and editor save/focus events refresh external
@@ -304,8 +339,8 @@ movement does not start a new Git blame process. >lua
         inline = {
           enabled = false,
           position = "eol",
-          format = "{author}, {date}: {summary}",
-          date_format = "%Y-%m-%d",
+          format = "{author}, {date} · {summary}",
+          date_format = "%Y/%m/%d, %H:%M",
           delay = 250,
         },
         file = {
@@ -316,6 +351,9 @@ movement does not start a new Git blame process. >lua
       },
     })
 <
+Inline blame shows local commit time to the minute:
+    Alice, 2026/11/16, 10:49 · Update settings
+
 Format fields: {author}, {date}, {summary}, {sha} (eight characters), {email}.
 Dates use os.date formats. inline.position is "eol" or "statusline".
 file.width defaults to "auto", which uses the widest formatted annotation row.
@@ -431,14 +469,22 @@ EDIT WORKING FILES                                            *igit-edit-file*
 Press e or E on a file in Commit Changes to edit its working copy in this Neovim
 instance. Requires the matching native IGit build. Existing loaded buffers keep
 unsaved text. Floating IGit windows hide after the switch; split windows remain
-visible and tab sessions remain open while focus returns to the source window.
+visible and tab sessions remain open while focus returns to an editing window.
 The terminal job, drafts and checked files are retained; reopen the same command
 or use your IGit mapping to return. Saving updates the working copy, and IGit's
 watcher refreshes the view. Opening/editing does not stage the file.
 
-Normal modified-buffer guards apply. A blocked switch or missing file leaves
-the IGit window available with an error. Containers, deleted files and submodule
-directories require an existing file target. The plugin handles session-scoped
+An existing target window in the source tab is reused first, then a suitable
+source or other editing window. Modified buffers that cannot be hidden safely
+keep their text and options, including with bufhidden=wipe, delete, or unload.
+If every candidate is protected, a new split opens the file. Buffer-locked
+windows, previews, terminals, and utility buffers are preserved.
+A buffer-locked ordinary window already showing the target may receive focus.
+
+Other opening failures leave the IGit window available with a concise error.
+An unused fallback split is closed; modified target text in a fallback is kept.
+Containers, deleted files and submodule directories require an existing file
+target. The plugin handles session-scoped
 terminal requests; no RPC server or second editor is needed. Outside this plugin,
 IGit uses the editor selected by git var GIT_EDITOR.
 
@@ -461,8 +507,8 @@ uses a separate buffer. The filetype and syntax come from the original filename
 and path. Missing paths, submodules, non-blob entries, binary data, invalid
 UTF-8, and blobs larger than 512 KiB are rejected. Floating IGit windows hide
 after a successful open; splits stay visible and tabs stay open while focus
-returns to the source window. Normal modified-buffer guards apply when 'hidden'
-is off.
+returns to an editing window. The same safe window selection and split fallback
+as working-file editing apply; protected source buffers keep their unsaved text.
 
 The native process reads an immutable Git blob and validates UTF-8, NULs, and
 the 512 KiB limit before emitting a request. The plugin repeats validation and
@@ -518,11 +564,16 @@ require("igit").file_diff({options})
 
 require("igit").next_hunk()
 require("igit").prev_hunk()
-    Navigate staged and unstaged hunks. Counts work from Lua mappings.
+    Navigate staged and unstaged hunks. An optional "all", "staged", or
+    "unstaged" argument filters navigation. Counts work from Lua mappings.
 
-require("igit").preview_hunk()
+require("igit").preview_hunk({target})
     Preview the hunk under the cursor in a read-only floating diff without
-    moving focus or running another Git command.
+    moving focus. Optional target is "staged" or "unstaged". Reuses a current
+    snapshot or refreshes a stale one.
+
+require("igit").undo_stage()
+    Restore the prior index entry for this path. See |:IgitUndoStage|.
 
 require("igit").stage_hunk({range})
 require("igit").unstage_hunk({range})
@@ -568,6 +619,61 @@ reports the exit code, and permits a new launch. Use :bdelete! to explicitly
 stop and remove a terminal buffer. Current-file diff sessions are one-shot:
 hiding one imports its snapshot, ends the viewer process, and removes temporary
 files. Reopening always starts a new snapshot and session.
+
+On ordinary session hide, window close, or exit, loaded working-file buffers
+in the workspace are reconciled. This includes repositories below the launch
+directory and the containing repository for a subdirectory launch. Clean
+buffers run checktime with autoread temporarily enabled. Modified buffers keep
+their text and metadata; concurrent disk changes produce a warning to review
+before saving. A later exit also checks writes made while hidden.
+Affected repositories emit IgitChanged to refresh signs, status, and blame.
+Completed status changes emit IgitUpdated. The private current-file diff import
+and its changedtick checks remain separate.
+Disk fingerprints hash at most 1 MiB; larger files use size, mode, identity,
+and modification/change timestamps. Capture and save hooks only inspect loaded
+files within managed session roots.
+The large-file fallback cannot detect edits preserving all of those metadata
+values.
+
+==============================================================================
+CAPABILITIES AND HEALTH                                           *igit-health*
+
+:checkhealth igit
+    Report Neovim and Git availability, the resolved IGit executable, actual
+    application version, capability schema, editor protocol, and features.
+    Dynamic command selectors are evaluated using the current directory.
+
+Before launching, the plugin probes the configured argv with --capabilities
+and a one-second timeout. Results are cached by executable identity, timestamps,
+and argv. Rebuilding or switching binaries invalidates the probe. Existing
+processes retain their original contract until they exit.
+
+Supported response (extra future fields are accepted): >
+    {
+      "schema_version": 1,
+      "version": "0.1.3",
+      "editor_protocol": 1,
+      "capabilities": ["editor", "revision", "file-diff", "repository-events"]
+    }
+<
+Application version is informational. Schema 1 and editor protocol 1 are
+required for their integrations. Old, invalid, and partially capable binaries
+can still launch ordinary panels. Integrated actions explain missing features
+or incompatible protocols; current-file diff is rejected before snapshot
+creation or hiding an existing terminal.
+
+Repository invalidation uses OSC 51: >
+    ESC ] 51 ; igit-changed ; {JSON} BEL
+<
+The JSON object contains version=1, session=IGIT_NVIM_SESSION, and an absolute
+repo path. The originating terminal buffer and token must match. Authenticated
+events reconcile loaded buffers in that repository and emit IgitChanged.
+Events indicate invalidation, not successful writes. Foreign-session, malformed,
+and relative-path events are ignored. Hidden sessions can invalidate without
+stealing focus. Authenticated incompatible editor/revision requests are
+diagnosed while the originating terminal owns focus. Inactive editor requests
+cannot open buffers or display delayed errors over the current editor.
+Invalid or foreign requests remain ignored.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:
